@@ -82,12 +82,15 @@ RUN dnf install -y --setopt=install_weak_deps=0 --nodocs gcc \
 # install vllm wheel first, so that torch etc will be installed
 RUN --mount=type=bind,from=build,src=/workspace/dist,target=/workspace/dist \
     --mount=type=cache,target=/root/.cache/pip \
-    pip install $(echo dist/*.whl)'[tensorizer]' --verbose
+    pip install $(echo dist/*.whl)'[tensorizer]' jinja2>=3.1.5 --verbose
 
 ENV HF_HUB_OFFLINE=1 \
     PORT=8000 \
     HOME=/home/vllm \
-    VLLM_USAGE_SOURCE=production-docker-image
+    VLLM_USAGE_SOURCE=production-docker-image \
+    VLLM_NO_USAGE_STATS=1 \
+    VLLM_SKIP_WARMUP=true \
+    PT_HPU_MAX_COMPOUND_OP_SIZE=10
 
 # setup non-root user for OpenShift
 RUN umask 002 \
@@ -105,7 +108,7 @@ USER root
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=bind,from=build,src=/workspace/dist,target=/workspace/dist \
-    pip install $(echo dist/*.whl)'[tensorizer]' vllm-tgis-adapter==0.5.3
+    pip install $(echo dist/*.whl)'[tensorizer]' vllm-tgis-adapter==0.6.1
 
 ENV GRPC_PORT=8033 \
     PORT=8000 \
