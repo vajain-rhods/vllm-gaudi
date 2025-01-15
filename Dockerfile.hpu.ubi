@@ -82,7 +82,7 @@ RUN dnf install -y --setopt=install_weak_deps=0 --nodocs gcc \
 # install vllm wheel first, so that torch etc will be installed
 RUN --mount=type=bind,from=build,src=/workspace/dist,target=/workspace/dist \
     --mount=type=cache,target=/root/.cache/pip \
-    pip install $(echo dist/*.whl)'[tensorizer]' --verbose
+    pip install $(echo dist/*.whl)'[tensorizer]' jinja2>=3.1.5 --verbose
 
 ENV HF_HUB_OFFLINE=1 \
     PORT=8000 \
