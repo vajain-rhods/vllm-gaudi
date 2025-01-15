@@ -49,7 +49,7 @@ COPY requirements-hpu.txt requirements-hpu.txt
 COPY pyproject.toml pyproject.toml
 
 # max jobs used by Ninja to build extensions
-ARG max_jobs=80
+ARG max_jobs=2
 ENV MAX_JOBS=${max_jobs}
 # # make sure punica kernels are built (for LoRA)
 # HPU currently doesn't support LoRA
