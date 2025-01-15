@@ -105,7 +105,7 @@ USER root
 
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=bind,from=build,src=/workspace/dist,target=/workspace/dist \
-    pip install $(echo dist/*.whl)'[tensorizer]' vllm-tgis-adapter==0.5.3
+    pip install $(echo dist/*.whl)'[tensorizer]' vllm-tgis-adapter==0.6.1
 
 ENV GRPC_PORT=8033 \
     PORT=8000 \
