@@ -89,6 +89,7 @@ ENV HF_HUB_OFFLINE=1 \
     HOME=/home/vllm \
     VLLM_USAGE_SOURCE=production-docker-image \
     VLLM_NO_USAGE_STATS=1 \
+    VLLM_SKIP_WARMUP=true \
     PT_HPU_MAX_COMPOUND_OP_SIZE=10
 
 # setup non-root user for OpenShift
@@ -97,6 +98,9 @@ RUN umask 002 \
     && chmod g+rwx $HOME /usr/src /workspace
 
 COPY LICENSE /licenses/vllm.md
+
+# Copy only .jinja files from example directory to template directory
+COPY examples/*.jinja /app/data/template/
 
 USER 2000
 ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
