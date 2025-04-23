@@ -1,15 +1,9 @@
 name: cpu-test
 
 on:
-  # Trigger the workflow on push or pull request,
-  # but only for the habana_main branch
-  push:
-    branches:
-      - habana_main
   pull_request:
-    branches:
-      - habana_main
-
+  push:
+    branches: [main]
 
 jobs:
   cputest:
