@@ -901,7 +901,6 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                         "false") in ("1", "true")
                     config = FP8Config.from_json_file(
                         os.getenv("QUANT_CONFIG", ""))
-                    self._inc_preprocess_(self.model, config)
                     if config.measure:
                         self.model = prepare(self.model, config)
                     elif config.quantize:
