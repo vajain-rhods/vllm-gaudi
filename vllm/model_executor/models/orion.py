@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from
 # https://huggingface.co/OrionStarAI/Orion-14B-Base/blob/main/modeling_orion.py
 # Copyright (c) OrionStar Inc.
@@ -75,6 +77,7 @@ class OrionAttention(nn.Module):
         max_position_embeddings: int = 8192,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -126,7 +129,8 @@ class OrionAttention(nn.Module):
                               self.scaling,
                               num_kv_heads=self.num_kv_heads,
                               cache_config=cache_config,
-                              quant_config=quant_config)
+                              quant_config=quant_config,
+                              prefix=f"{prefix}.attn")
 
     def forward(
         self,
@@ -150,6 +154,7 @@ class OrionDecoderLayer(nn.Module):
         config: PretrainedConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -166,6 +171,7 @@ class OrionDecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             cache_config=cache_config,
             quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
         )
         self.mlp = OrionMLP(
             hidden_size=self.hidden_size,
@@ -226,10 +232,7 @@ class OrionModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: OrionDecoderLayer(
-                config,
-                cache_config,
-                quant_config,
-            ),
+                config, cache_config, quant_config, prefix=prefix),
             prefix=f"{prefix}.layers")
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = (

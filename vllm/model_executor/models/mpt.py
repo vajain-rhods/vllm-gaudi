@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from https://huggingface.co/mosaicml/mpt-7b/tree/main
 import math
 from typing import Iterable, List, Optional, Set, Tuple, Union
@@ -50,6 +52,7 @@ class MPTAttention(nn.Module):
         config: MPTConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.d_model = config.d_model
@@ -115,7 +118,8 @@ class MPTAttention(nn.Module):
                               alibi_slopes=alibi_slopes,
                               num_kv_heads=self.num_kv_heads,
                               cache_config=cache_config,
-                              quant_config=quant_config)
+                              quant_config=quant_config,
+                              prefix=f"{prefix}.attn")
 
     def forward(
         self,
@@ -176,11 +180,15 @@ class MPTBlock(nn.Module):
         config: MPTConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         hidden_size = config.d_model
         self.norm_1 = nn.LayerNorm(hidden_size)
-        self.attn = MPTAttention(config, cache_config, quant_config)
+        self.attn = MPTAttention(config,
+                                 cache_config,
+                                 quant_config,
+                                 prefix=f"{prefix}.attn")
         self.norm_2 = nn.LayerNorm(hidden_size)
         self.ffn = MPTMLP(config, quant_config)
 
@@ -224,7 +232,8 @@ class MPTModel(nn.Module):
         )
         self.start_layer, self.end_layer, self.blocks = make_layers(
             config.n_layers,
-            lambda prefix: MPTBlock(config, cache_config, quant_config),
+            lambda prefix: MPTBlock(
+                config, cache_config, quant_config, prefix=prefix),
             prefix=f"{prefix}.blocks")
         self.norm_f = nn.LayerNorm(config.d_model)
         if config.no_bias:

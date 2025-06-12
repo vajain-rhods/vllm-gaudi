@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 ###############################################################################
 # Copyright (C) 2024 Habana Labs, Ltd. an Intel Company
 ###############################################################################
@@ -12,29 +14,35 @@ import math
 import os
 import time
 from array import array
-from enum import IntEnum
+from enum import Enum, IntEnum
 from typing import (TYPE_CHECKING, Any, Callable, Dict, List, NamedTuple,
                     Optional, Set, Tuple, Type, TypeVar, Union)
 
 import habana_frameworks.torch as htorch
 import habana_frameworks.torch.internal.bridge_config as bc
 import torch
-from vllm_hpu_extension.bucketing import HPUBucketingContext
+import vllm_hpu_extension.environment as environment
+from vllm_hpu_extension.bucketing.common import get_bucketing_context
+from vllm_hpu_extension.flags import enabled_flags
 from vllm_hpu_extension.ops import LoraMask as LoraMask
-from vllm_hpu_extension.ops import batch2block, block2batch
 from vllm_hpu_extension.profiler import (HabanaHighLevelProfiler,
                                          HabanaMemoryProfiler, format_bytes)
 
 from vllm.attention import AttentionMetadata, get_attn_backend
+from vllm.attention.backends.abstract import AttentionType
+from vllm.attention.backends.hpu_attn import HPUAttentionImpl
 from vllm.config import DeviceConfig, VllmConfig
-from vllm.distributed import broadcast_tensor_dict
+from vllm.distributed import broadcast_tensor_dict, get_pp_group
 from vllm.distributed.parallel_state import get_world_group
+from vllm.forward_context import set_forward_context
+from vllm.inputs import INPUT_REGISTRY, InputRegistry
 from vllm.logger import init_logger
 from vllm.lora.layers import LoRAMapping
 from vllm.lora.request import LoRARequest
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 from vllm.model_executor import SamplingMetadata
 from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.layers.sampler import SamplerOutput
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding)
@@ -42,12 +50,15 @@ from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
 from vllm.model_executor.sampling_metadata import SequenceGroupToSample
 from vllm.multimodal import (MULTIMODAL_REGISTRY, BatchedTensorInputs,
-                             MultiModalKwargs)
+                             MultiModalKwargs, MultiModalPlaceholderMap,
+                             MultiModalRegistry)
 from vllm.sampling_params import SamplingParams
 from vllm.sequence import (CompletionSequenceGroupOutput, IntermediateTensors,
                            Logprob, SequenceData, SequenceGroupMetadata,
                            SequenceOutput)
-from vllm.utils import (is_fake_hpu, is_pin_memory_available,
+from vllm.transformers_utils.config import uses_mrope
+from vllm.utils import (bind_kv_cache, is_fake_hpu, is_pin_memory_available,
+                        make_mrope_positions_tensor_with_pad,
                         make_tensor_with_pad)
 from vllm.worker.model_runner_base import (
     ModelRunnerBase, ModelRunnerInputBase,
@@ -68,6 +79,18 @@ _PAD_SLOT_ID = 0
 _PAD_BLOCK_ID = 0
 
 LORA_WARMUP_RANK = 8
+
+VLLM_DELAYED_SAMPLING = os.environ.get('VLLM_DELAYED_SAMPLING',
+                                       'false').lower() == 'true'
+VLLM_MERGED_PREFILL = os.environ.get('VLLM_MERGED_PREFILL',
+                                     'false').lower() == 'true'
+DUMMY_TOKEN_ID = -1
+
+
+class PhaseType(Enum):
+    PREFILL = 'prefill'
+    PREFIX_PREFILL = 'prefix_prefill'
+    DECODE = 'decode'
 
 
 def subtuple(obj: object,
@@ -134,7 +157,17 @@ def flatten(in_list):
     return list(itertools.chain(*in_list))
 
 
-def get_decoder_layer_suffix(model_type):
+def make_cpu_tensor(data, max_len, pad, dtype, flat) -> torch.Tensor:
+    if flat:
+        data = [flatten(data)]
+    return make_tensor_with_pad(data,
+                                max_len=max_len,
+                                pad=pad,
+                                dtype=dtype,
+                                device='cpu')
+
+
+def get_target_layer_suffix_list(model_type) -> list[str]:
     # This sets the suffix for the hidden layer name, which is controlled by
     # VLLM_CONFIG_HIDDEN_LAYERS. The default suffix is "DecoderLayer," which is
     # applicable for most language models such as LLaMA, Qwen, and BART. If the
@@ -144,13 +177,17 @@ def get_decoder_layer_suffix(model_type):
         "gpt_bigcode": "BigCodeBlock",
     }
 
-    return decoder_layer_table.get(model_type, "DecoderLayer")
+    return [
+        decoder_layer_table.get(model_type, "DecoderLayer"), "EncoderLayer"
+    ]
 
 
-def modify_decoder_layer(module: torch.nn.Module,
-                         suffix="DecoderLayer",
-                         n=1,
-                         counter=None):
+def modify_model_layers(module: torch.nn.Module,
+                        suffix_list: list[str],
+                        n=1,
+                        counter=None):
+    """Currently add mark_step at the end of specified layers.
+    """
 
     def forward_hook(module, args, output):
         htorch.core.mark_step()
@@ -160,60 +197,74 @@ def modify_decoder_layer(module: torch.nn.Module,
         counter = [0]
 
     for child_name, child_module in module.named_children():
-        if child_module.__class__.__name__.endswith(suffix):
+        if any(
+                child_module.__class__.__name__.endswith(layer)
+                for layer in suffix_list):
             counter[0] += 1
             if counter[0] % n == 0:
                 child_module.register_forward_hook(forward_hook)
         else:
-            modify_decoder_layer(child_module, suffix, n, counter)
+            modify_model_layers(child_module, suffix_list, n, counter)
 
 
-class HpuModelAdapter:
+def get_path_to_rope(model: torch.nn.Module):
+    """Dynamically get the path to the RotaryEmbedding layer in the model.
+    This function will recursively search through the module hierarchy to find
+    a RotaryEmbedding layer and return the full path to that layer as a list
+    of names.
+    If no such layer is found, it returns None.
+    """
 
-    def __init__(self, model, block_size, dtype, enforce_eager):
+    def find_rope_layer(parent, path):
+        # Base case: check if this parent is None
+        if parent is None:
+            return None
+
+        # Check if the current layer is a RotaryEmbedding
+        if hasattr(parent, 'named_children'):
+            for child_name, child_module in parent.named_children():
+                # If the current child is of type RotaryEmbedding,
+                # return the full path
+                if child_module.__class__.__name__.endswith("RotaryEmbedding"):
+                    return path + [child_name]
+                # Otherwise, recurse into this child to check its children
+                result = find_rope_layer(child_module, path + [child_name])
+                if result is not None:
+                    return result
+        return None
+
+    # Start the search from the top level model
+    path_to_rope = find_rope_layer(model, [])
+
+    # Return the result if found, otherwise None
+    return path_to_rope
+
+
+class HpuModelAdapter(torch.nn.Module):
+
+    def __init__(self, model, vllm_config, layer_names, is_causal):
+        super().__init__()
         self.model = model
-        self.prefill_use_fusedsdpa = os.getenv('VLLM_PROMPT_USE_FUSEDSDPA',
-                                               '1').lower() in ['1', 'true'] \
-                                                and not is_fake_hpu()
-        self.block_size = block_size
-        self.dtype = dtype
-        if not is_fake_hpu() and not htorch.utils.internal.is_lazy(
-        ) and not enforce_eager:
-            if os.getenv('VLLM_REGIONAL_COMPILATION',
-                         'true').lower() == 'true':
-                self.regional_compilation_layers_list = [
-                    RMSNorm, VocabParallelEmbedding
-                ]
-                self._regional_compilation(self.model)
-            else:
-                self.model = torch.compile(self.model,
-                                           backend='hpu_backend',
-                                           dynamic=False)
-
-    def _regional_compilation(self,
-                              module,
-                              parent_module=None,
-                              module_name=None):
-        if isinstance(module, torch.nn.ModuleList):
-            for children_name, children_module in module.named_children():
-                self._compile_region(module, children_name, children_module)
-        elif any(
-                isinstance(module, layer)
-                for layer in self.regional_compilation_layers_list):
-            self._compile_region(parent_module, module_name, module)
-        else:
-            for children_name, children_module in module.named_children():
-                self._regional_compilation(children_module, module,
-                                           children_name)
-
-    def _compile_region(self, model, name, module):
-        module = torch.compile(module, backend='hpu_backend', dynamic=False)
-        setattr(model, name, module)
+        self.prefill_use_fusedsdpa = "fsdpa" in enabled_flags()
+        self.recompute_cos_sin = os.getenv('VLLM_COS_SIN_RECOMPUTE',
+                                           'false').lower() in ['1', 'true']
+        self.vllm_config = vllm_config
+        self.block_size = vllm_config.cache_config.block_size
+        self.dtype = vllm_config.model_config.dtype
+        self.layer_names = layer_names
+        self.is_pooler = hasattr(self.model, "_pooler")
+        self.is_causal = is_causal
+        self.use_merged_prefill = VLLM_MERGED_PREFILL
 
     def _set_attn_bias(self, attn_metadata, batch_size, seq_len, device,
                        dtype):
-        if (attn_metadata is None or self.prefill_use_fusedsdpa
+        if (attn_metadata is None
+                or (self.prefill_use_fusedsdpa and self.is_causal
+                    and attn_metadata.block_list is None)
                 or not attn_metadata.is_prompt):
+            return attn_metadata
+
+        if attn_metadata.attn_bias is not None:
             return attn_metadata
 
         prefill_metadata = attn_metadata
@@ -238,14 +289,28 @@ class HpuModelAdapter:
                                  dtype=torch.int32).view(1, seq_len).ge(
                                      query_lens_t.unsqueeze(-1)).view(
                                          batch_size, 1, 1, seq_len))
-        causal_mask = torch.triu(torch.ones((batch_size, 1, seq_len, seq_len),
-                                            device=device,
-                                            dtype=torch.bool),
-                                 diagonal=1)
-        mask = causal_mask.logical_or(len_mask)
+        if self.is_causal:
+            attn_mask = torch.triu(torch.ones(
+                (batch_size, 1, seq_len, seq_len),
+                device=device,
+                dtype=torch.bool),
+                                   diagonal=1)
+        else:
+            attn_mask = torch.zeros((batch_size, 1, seq_len, seq_len),
+                                    device=device,
+                                    dtype=torch.bool)
+        if self.is_pooler:
+            len_mask_v = len_mask.view(batch_size, 1, seq_len, 1)
+            mask = attn_mask.logical_or(len_mask).logical_or(len_mask_v)
+            off_value = -3E38  #small number, avoid nan and overflow
+        else:
+            mask = attn_mask.logical_or(
+                len_mask)  #no need for len_mask_v as decode overwrites it
+            off_value = -math.inf
+
         mask = torch.concat((past_mask, mask), dim=-1)
         attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(
-            mask, -math.inf))
+            mask, off_value))
         attn_metadata = prefill_metadata._replace(attn_bias=attn_bias)
         return attn_metadata
 
@@ -258,11 +323,11 @@ class HpuModelAdapter:
         attn_bias = (torch.zeros_like(mask, dtype=dtype).masked_fill_(
             mask, -math.inf))
 
-        if not is_fake_hpu() and htorch.utils.internal.is_lazy():
+        if not is_fake_hpu():
             block_mapping = torch.nn.functional.one_hot(metadata.block_groups,
                                                         num_classes=batch_size)
         else:
-            # Unfortunately one_hot on CPU/torch.compile mode/eager mode
+            # Unfortunately one_hot on CPU
             # doesn't handle out of bounds classes so we need to convert
             # all negative values to 0 (block_mapping) or bs (block_groups)
             block_groups = metadata.block_groups.to(torch.long)
@@ -278,20 +343,10 @@ class HpuModelAdapter:
                                      attn_bias=attn_bias)
         return metadata
 
-    def _set_block_scales(self, metadata, device):
-        block_mapping = metadata.block_mapping
-        ones = torch.ones((block_mapping.size(0), ),
-                          device=device,
-                          dtype=block_mapping.dtype)
-        sums = batch2block(block2batch(ones, block_mapping), block_mapping)
-        block_scales = torch.reciprocal(torch.maximum(ones, sums))
-        metadata = metadata._replace(block_scales=block_scales)
-        return metadata
-
     def _set_indices_and_offsets(self, metadata, block_size, is_prompt):
         slot_mapping = metadata.slot_mapping.flatten()
         indices = torch.div(slot_mapping, block_size, rounding_mode="floor")
-        if is_prompt:
+        if is_prompt and not self.use_merged_prefill:
             indices = indices.unflatten(0, (-1, block_size))[:, 0]
             offsets = None
         else:
@@ -302,31 +357,74 @@ class HpuModelAdapter:
 
     def _update_metadata(self, attn_metadata, batch_size, seq_len, device,
                          dtype):
+
         if attn_metadata.is_prompt:
             attn_metadata = self._set_attn_bias(attn_metadata, batch_size,
                                                 seq_len, device, dtype)
         else:
             attn_metadata = self._set_block_mapping(attn_metadata, batch_size,
                                                     device, dtype)
-            attn_metadata = self._set_block_scales(attn_metadata, device)
         attn_metadata = self._set_indices_and_offsets(attn_metadata,
                                                       self.block_size,
                                                       attn_metadata.is_prompt)
         return attn_metadata
+
+    def _prepare_cos_sin(self, positions):
+        """Navigate through the model using the provided path and call
+        the prepare_cos_sin method on the 'RotaryEmbedding' layer."""
+
+        current_module = self.model  # Start from the top level of the model
+
+        for layer in self.layer_names:
+            if layer.isdigit():  # Check if the layer is an index
+                layer = int(layer)
+
+            # Check if the current layer is a name in a module
+            if isinstance(
+                    layer,
+                    str) and not isinstance(layer, int):  # Name-based access
+                current_module = getattr(current_module, layer)
+            elif isinstance(layer,
+                            int):  # Indexed-based access (like ModuleList)
+                current_module = list(current_module._modules.values())[layer]
+
+        # At the end, we should be at the RotaryEmbedding layer.
+        if hasattr(current_module, 'prepare_cos_sin'):
+            current_module.prepare_cos_sin(
+                positions, recompute_cos_sin=self.recompute_cos_sin)
+        else:
+            raise AttributeError(
+                "The module at the end of the path does not have \
+               a 'prepare_cos_sin' method.")
 
     def forward(self, *args, **kwargs):
         kwargs = kwargs.copy()
         selected_token_indices = kwargs.pop('selected_token_indices')
         if 'warmup_mode' in kwargs:
             kwargs.pop('warmup_mode')
+        virtual_engine = 0
+        if 'virtual_engine' in kwargs:
+            virtual_engine = kwargs.pop('virtual_engine')
         input_ids = kwargs['input_ids']
         kwargs['attn_metadata'] = self._update_metadata(
             kwargs['attn_metadata'], input_ids.size(0), input_ids.size(1),
             input_ids.device, self.dtype)
-        LoraMask.setLoraMask(kwargs.pop('lora_mask'))
-        hidden_states = self.model(*args, **kwargs)
-        hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        hidden_states = hidden_states.index_select(0, selected_token_indices)
+        if 'lora_mask' in kwargs:
+            LoraMask.setLoraMask(kwargs.pop('lora_mask'))
+        model_config = getattr(self.model, "config", None)
+        model_is_mrope = uses_mrope(model_config)
+        if self.layer_names is not None and not model_is_mrope:
+            self._prepare_cos_sin(kwargs['positions'])
+
+        with set_forward_context(kwargs['attn_metadata'], self.vllm_config,
+                                 virtual_engine):
+            hidden_states = self.model(*args, **kwargs)
+            if not get_pp_group().is_last_rank:
+                return hidden_states
+            hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
+            if selected_token_indices is not None:
+                hidden_states = hidden_states.index_select(
+                    0, selected_token_indices)
         return hidden_states
 
     def compute_logits(self, *args, **kwargs):
@@ -334,6 +432,9 @@ class HpuModelAdapter:
 
     def sample(self, *args, **kwargs):
         return self.model.sample(*args, **kwargs)
+
+    def make_empty_intermediate_tensors(self, *args, **kwargs):
+        return self.model.make_empty_intermediate_tensors(*args, **kwargs)
 
     def generate_proposals(self, *args, **kwargs):
         return self.model.generate_proposals(*args, **kwargs)
@@ -511,8 +612,12 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         kv_cache_dtype: Optional[str] = "auto",
         is_driver_worker: bool = False,
         return_hidden_states: bool = False,
+        input_registry: InputRegistry = INPUT_REGISTRY,
+        mm_registry: MultiModalRegistry = MULTIMODAL_REGISTRY,
+        is_causal: bool = True,
     ):
         ModelRunnerBase.__init__(self, vllm_config=vllm_config)
+        environment.set_model_config(self.model_config)
         self.is_driver_worker = is_driver_worker
         self.return_hidden_states = return_hidden_states
 
@@ -523,6 +628,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         if is_fake_hpu():
             self.device_config.device = torch.device('cpu')
             self.device_config.device_type = 'cpu'
+            self.load_config.device = None
         self.device = self.device_config.device
         self.enforce_eager = self.model_config.enforce_eager
         self.max_num_seqs = self.scheduler_config.max_num_seqs
@@ -533,6 +639,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         self.max_num_batched_tokens = \
             self.scheduler_config.max_num_batched_tokens
         self.block_size = self.cache_config.block_size
+        self.use_merged_prefill = VLLM_MERGED_PREFILL
+        assert not (self.scheduler_config.use_padding_aware_scheduling
+                    and self.use_merged_prefill), \
+            'Merged prefill is not compatible with padding aware scheduling!'
 
         self.pin_memory = is_pin_memory_available()
         self.kv_cache_dtype = self.cache_config.cache_dtype
@@ -547,7 +657,16 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             self.kv_cache_dtype,
             self.block_size,
             self.model_config.is_attention_free,
+            use_mla=self.model_config.use_mla,
         ) if needs_attn_backend else None
+
+        # Multi-modal data support
+        self.input_registry = input_registry
+        self.mm_registry = mm_registry
+        self.mm_registry = MULTIMODAL_REGISTRY
+        self.multi_modal_input_mapper = self.mm_registry \
+            .create_input_mapper(self.model_config)
+        self.mm_registry.init_mm_limits_per_prompt(self.model_config)
 
         # Lazy initialization
         self.lora_manager: LRUCacheWorkerLoRAManager = None
@@ -559,32 +678,57 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         self.profiler_counter_helper = HabanaProfilerCounterHelper()
         self.seen_configs: set = set()
         self._mem_margin: Optional[int] = None
+        HPUBucketingContext = get_bucketing_context()
         self.bucketing_ctx = HPUBucketingContext(self.max_num_seqs,
                                                  self.max_num_prefill_seqs,
                                                  self.block_size,
-                                                 self.max_num_batched_tokens)
+                                                 self.max_num_batched_tokens,
+                                                 self.use_merged_prefill,
+                                                 self.max_model_len)
         self.graphed_buckets: Set[Any] = set()
 
         self._set_gc_threshold()
+        if self.vllm_config.cache_config.enable_prefix_caching:
+            os.environ.setdefault("VLLM_CONTIGUOUS_PA", "False")
+            assert os.environ.get(
+                "VLLM_CONTIGUOUS_PA",
+                "").lower() != "true", "Contiguous PA doesn't support APC"
         self.use_contiguous_pa = os.environ.get('VLLM_CONTIGUOUS_PA',
                                                 'true').lower() == 'true'
-        # For multi-step scheduling
+        if vllm_config.speculative_config is not None \
+            and self.use_contiguous_pa:
+            raise ValueError(
+                "Speculative decoding is not supported with "
+                "contiguous PA, please set VLLM_CONTIGUOUS_PA=false")
+        # For both multi-step scheduling and delayed sampling
         self.cached_step_outputs: List[torch.Tensor] = []
+        self.is_pooler = False
+        self.is_causal = is_causal
+        # For delayed sampling
+        self.cached_step_inputs: List[
+            ModelInputForHPUWithSamplingMetadata] = []
 
     def _set_gc_threshold(self) -> None:
-        # Read https://docs.python.org/3/library/gc.html#gc.set_threshold
-        # for comprehensive description of gc generations.
-        # We can either use VLLM_GC_THR_GEN[0-2] (this has higher priority)
-        # to set particular generation threshold or use simpler
-        # VLLM_GC_THR_MULTIPLIER to multiply default values.
-        default_gc_thrs = list(gc.get_threshold())
+        """
+        Read https://docs.python.org/3/library/gc.html#gc.set_threshold
+        for comprehensive description of gc generations.
+        We can either use VLLM_GC_THR_GEN[0-2] (this has higher priority)
+        to set particular generation threshold or use simpler
+        VLLM_GC_THR_MULTIPLIER to multiply default values.
+        """
+
+        # gc.get_threshold default, avoiding potential overflow due to
+        # multiplier and set later (get->mult->set->repeat->...->overflow)
+        default_gc_thrs = [700, 10, 10]
+
         requested_gc_thrs = [0] * len(default_gc_thrs)
         for i in range(len(default_gc_thrs)):
             requested_gc_thrs[i] = int(
                 os.environ.get(f'VLLM_GC_THR_GEN{i}', default_gc_thrs[i]))
         if requested_gc_thrs == default_gc_thrs:
-            gc_thr_multiplier = int(os.environ.get('VLLM_GC_THR_MULTIPLIER',
-                                                   2))
+            # 16*threshold is rare enough for gc to not cause perf issues
+            gc_thr_multiplier = int(
+                os.environ.get('VLLM_GC_THR_MULTIPLIER', 16))
             requested_gc_thrs = [
                 t * gc_thr_multiplier for t in default_gc_thrs
             ]
@@ -596,6 +740,36 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
 
         self.skip_warmup = os.environ.get('VLLM_SKIP_WARMUP',
                                           'false').lower() == 'true'
+
+    @property
+    def model_is_mrope(self) -> bool:
+        config = self.model_config.hf_config
+        return uses_mrope(config)
+
+    # Chendi: Requested to be added by INC team
+    def _remove_duplicate_submodules_(self, model, inc_config):
+        # FIXME: (Yi)  for deepseek v3 only
+        self_attn = model.model.layers[0].self_attn
+        for layer in model.model.layers:
+            self_attn = layer.self_attn
+            # delete attrs: q_b_proj, kv_b_proj, o_proj in self_attn,
+            # as they have been transferred to the MLAImpl.
+            if hasattr(self_attn, "q_b_proj"):
+                delattr(self_attn, "q_b_proj")
+            if hasattr(self_attn, "kv_b_proj"):
+                delattr(self_attn, "kv_b_proj")
+            if hasattr(self_attn, "o_proj"):
+                delattr(self_attn, "o_proj")
+
+    def _inc_preprocess_(self, model: torch.nn.Module, inc_config):
+        architectures = getattr(self.model_config.hf_config, "architectures",
+                                [])
+        if "DeepseekV3ForCausalLM" in architectures:
+            self._remove_duplicate_submodules_(model, inc_config)
+
+    def _is_quant_with_inc(self):
+        quant_config = os.getenv("QUANT_CONFIG", None) is not None
+        return (self.model_config.quantization == "inc" or quant_config)
 
     def load_model(self) -> None:
         import habana_frameworks.torch.core as htcore
@@ -609,7 +783,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                    f"{next(self.model.parameters()).device} "
                    f"took {m_getmodel.get_summary_string()}")
             logger.info(msg)
-
+            self.is_pooler = hasattr(self.model, "_pooler")
             if self.lora_config:
                 assert hasattr(self.model, "supported_lora_modules"
                                ) and self.model.supported_lora_modules, (
@@ -619,7 +793,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                 assert hasattr(
                     self.model, "embedding_padding_modules"
                 ), "Model does not have embedding_padding_modules"
-
+                assert not self.lora_config.bias_enabled, \
+                    "Bias support in LoRA is not enabled in HPU yet."
+                assert not self.lora_config.fully_sharded_loras, \
+                    "Fully sharded LoRAs is not enabled in HPU yet."
                 if supports_multimodal(self.model):
                     logger.warning(
                         "Regarding multimodal models, vLLM currently "
@@ -645,19 +822,27 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                 )
                 self.model = self.lora_manager.create_lora_manager(self.model)
 
-            if self.model_config.quantization == 'inc':
+            if self._is_quant_with_inc():
                 logger.info("Preparing model with INC..")
                 with HabanaMemoryProfiler() as m_inc:
                     from neural_compressor.torch.quantization import (
                         FP8Config, convert, prepare)
+
+                    disable_mark_scales_as_const = os.getenv(
+                        "VLLM_DISABLE_MARK_SCALES_AS_CONST",
+                        "false") in ("1", "true")
                     config = FP8Config.from_json_file(
                         os.getenv("QUANT_CONFIG", ""))
+                    self._inc_preprocess_(self.model, config)
                     if config.measure:
                         self.model = prepare(self.model, config)
                     elif config.quantize:
                         self.model = convert(self.model, config)
-                    htcore.hpu_initialize(self.model,
-                                          mark_only_scales_as_const=True)
+                    if not disable_mark_scales_as_const:
+                        htcore.hpu_initialize(self.model,
+                                              mark_only_scales_as_const=True)
+                    if torch.distributed.is_initialized():
+                        torch.distributed.barrier()
                 self.inc_initialized_successfully = True
                 logger.info("Preparing model with INC took %s",
                             m_inc.get_summary_string())
@@ -667,24 +852,129 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
 
             hidden_layer_markstep_interval = int(
                 os.getenv('VLLM_CONFIG_HIDDEN_LAYERS', '1'))
-            modify_decoder_layer(
+            model_config = getattr(self.model, "config", None)
+            modify_model_layers(
                 self.model,
-                get_decoder_layer_suffix(self.model.config.model_type),
+                get_target_layer_suffix_list(
+                    model_config.
+                    model_type if model_config is not None else None),
                 hidden_layer_markstep_interval)
+            path_to_rope = get_path_to_rope(self.model)
             torch.hpu.synchronize()
-
+            self.is_causal = True
+            if self.is_pooler:
+                self.set_causal_option(self.model)
             with HabanaMemoryProfiler() as m_wrap:
-                self.model = _maybe_wrap_in_hpu_graph(
+                self.model = self._maybe_wrap_in_hpu_graph(
                     self.model,
-                    self.block_size,
-                    dtype=self.model_config.dtype,
-                    enforce_eager=self.enforce_eager)
+                    vllm_config=self.vllm_config,
+                    layer_names=path_to_rope,
+                    is_causal=self.is_causal)
             msg = f"Wrapping in HPU Graph took {m_wrap.get_summary_string()}"
+            logger.info(msg)
+            with HabanaMemoryProfiler() as m_wrap:
+                self._maybe_compile(self.model,
+                                    vllm_config=self.vllm_config,
+                                    layer_names=path_to_rope)
+            msg = f"Compiling took {m_wrap.get_summary_string()}"
             logger.info(msg)
 
         self.model_memory_usage = m.consumed_device_memory
         msg = f"Loading model weights took in total {m.get_summary_string()}"
         logger.info(msg)
+
+    def _add_dummy_seq(self, seq_group_metadata_list, is_prompt):
+        real_batch_size = len(seq_group_metadata_list)
+        batch_size_padded = self.bucketing_ctx.get_padded_batch_size(
+            real_batch_size, is_prompt)
+        batch_size_padding = batch_size_padded - real_batch_size
+
+        seq_group_metadata_list = seq_group_metadata_list.copy()
+
+        if batch_size_padding > 0:
+            if self.is_pooler:
+                temperature = None
+            else:
+                has_greedy_samples = any(
+                    seq_group_metadata.sampling_params.temperature == 0.0
+                    for seq_group_metadata in seq_group_metadata_list)
+                temperature = 0.0 if has_greedy_samples else 1.0
+            dummy_seq_group_metadata = self.create_dummy_seq_group_metadata(
+                -1, 0, is_prompt, temperature=temperature)
+            seq_group_metadata_list.extend(dummy_seq_group_metadata
+                                           for _ in range(batch_size_padding))
+        return seq_group_metadata_list, real_batch_size, batch_size_padded
+
+    def _maybe_wrap_in_hpu_graph(self, *args, **kwargs):
+        return htorch.hpu.wrap_in_hpu_graph(
+            HpuModelAdapter(*args, **kwargs),
+            disable_tensor_cache=True,
+        ) if htorch.utils.internal.is_lazy() else HpuModelAdapter(
+            *args, **kwargs)
+
+    def _maybe_compile(self, *args, **kwargs):
+        if not is_fake_hpu() and not htorch.utils.internal.is_lazy(
+        ) and not self.vllm_config.model_config.enforce_eager:
+            fullgraph = os.getenv('VLLM_T_COMPILE_FULLGRAPH',
+                                  'false').strip().lower() in ("1", "true")
+            if os.getenv('VLLM_REGIONAL_COMPILATION',
+                         'true').strip().lower() in ("1", "true"):
+                compiled_methods = [self.model._set_block_mapping]
+                for method in compiled_methods:
+                    method = torch.compile(method,
+                                           backend='hpu_backend',
+                                           fullgraph=fullgraph,
+                                           dynamic=False)
+                self.regional_compilation_layers_list = [
+                    RMSNorm, VocabParallelEmbedding
+                ]
+                self._regional_compilation(self.model, fullgraph)
+            else:
+                self.model = torch.compile(self.model,
+                                           backend='hpu_backend',
+                                           fullgraph=fullgraph,
+                                           dynamic=False)
+
+    def _regional_compilation(self,
+                              module,
+                              fullgraph,
+                              parent_module=None,
+                              module_name=None):
+        if isinstance(module, torch.nn.ModuleList):
+            for children_name, children_module in module.named_children():
+                self._compile_region(module, fullgraph, children_name,
+                                     children_module)
+        elif any(
+                isinstance(module, layer)
+                for layer in self.regional_compilation_layers_list):
+            self._compile_region(
+                parent_module,
+                fullgraph,
+                module_name,
+                module,
+            )
+        else:
+            for children_name, children_module in module.named_children():
+                self._regional_compilation(children_module, fullgraph, module,
+                                           children_name)
+
+    def _compile_region(
+        self,
+        model,
+        fullgraph,
+        name,
+        module,
+    ):
+        module = torch.compile(module,
+                               backend='hpu_backend',
+                               fullgraph=fullgraph,
+                               dynamic=False)
+        setattr(model, name, module)
+
+    def get_model(self) -> torch.nn.Module:
+        if isinstance(self.model, HpuModelAdapter):
+            return self.model.model
+        return self.model
 
     def _use_graphs(self, batch_size, seq_len, is_prompt):
         if self.enforce_eager:
@@ -696,12 +986,120 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
     def _is_valid_bucket(self, bucket):
         return bucket[0] * bucket[1] <= self.max_num_batched_tokens
 
+    def _num_blocks(self, attn_metadata):
+        if attn_metadata.block_list is None:
+            return 0
+        return attn_metadata.block_list.numel()
+
+    def _phase(self, attn_metadata):
+        phase_type: PhaseType
+        is_prompt = attn_metadata.is_prompt
+        is_prefix_prefill = is_prompt and attn_metadata.block_list is not None
+        if is_prompt and is_prefix_prefill:
+            phase_type = PhaseType.PREFIX_PREFILL
+        elif is_prompt and not is_prefix_prefill:
+            phase_type = PhaseType.PREFILL
+        elif not is_prompt:
+            phase_type = PhaseType.DECODE
+        else:
+            raise ValueError("Unrecognized pass type, likely due to malformed "
+                             "attention metadata")
+        return phase_type
+
+    def _check_config(self, batch_size, seq_len, attn_metadata, warmup_mode):
+        is_prefix_caching = self.vllm_config.cache_config.enable_prefix_caching
+        cfg: Optional[tuple] = None
+        assert cfg is None, "Configs changed between 2D and 3D"
+        if is_prefix_caching:
+            phase = self._phase(attn_metadata)
+            num_blocks = self._num_blocks(attn_metadata)
+            cfg = (batch_size, seq_len, num_blocks, phase)
+        else:
+            phase = 'prompt' if attn_metadata.is_prompt else 'decode'
+            cfg = (batch_size, seq_len, phase)
+        seen = cfg in self.seen_configs
+        self.seen_configs.add(cfg)
+        if not seen and not warmup_mode:
+            logger.warning("Configuration: %s was not warmed-up!",
+                           (phase.value, batch_size, seq_len,
+                            num_blocks) if is_prefix_caching else
+                           (phase, batch_size, seq_len))
+
+    def _get_mrope_positions_and_delta(self, seq_data, mm_kwargs, context_len):
+        image_grid_thw = mm_kwargs.get("image_grid_thw", None)
+        video_grid_thw = mm_kwargs.get("video_grid_thw", None)
+        second_per_grid_ts = mm_kwargs.get("second_per_grid_ts", None)
+        assert image_grid_thw is not None or video_grid_thw is not None, (
+            "mrope embedding type requires multi-modal input mapper "
+            "returns 'image_grid_thw' or 'video_grid_thw'.")
+        hf_config = self.model_config.hf_config
+        token_ids = seq_data.get_token_ids()
+        mrope_positions, mrope_position_delta = \
+            MRotaryEmbedding.get_input_positions(
+                token_ids,
+                hf_config=hf_config,
+                image_grid_thw=image_grid_thw,
+                video_grid_thw=video_grid_thw,
+                second_per_grid_ts=second_per_grid_ts,
+                context_len=context_len,
+            )
+        assert mrope_positions is not None
+        return mrope_positions, mrope_position_delta
+
+    def make_attn_bias(self, seq_lens, max_prompt_len, dtype):
+        seq_pos = [list(range(sl)) for sl in seq_lens]
+        seq_idx = [[i] * sl for i, sl in enumerate(seq_lens)]
+        seq_pos_t = make_cpu_tensor(seq_pos,
+                                    max_len=max_prompt_len,
+                                    pad=-1,
+                                    dtype=torch.long,
+                                    flat=self.use_merged_prefill)
+        seq_idx_t = make_cpu_tensor(seq_idx,
+                                    max_len=max_prompt_len,
+                                    pad=-1,
+                                    dtype=torch.long,
+                                    flat=self.use_merged_prefill)
+
+        q_seq_idx_t = seq_idx_t.unsqueeze(-1)
+        kv_seq_idx_t = seq_idx_t.unsqueeze(-2)
+        q_seq_pos_t = seq_pos_t.unsqueeze(-1)
+        kv_seq_pos_t = seq_pos_t.unsqueeze(-2)
+        seq_idx_t = q_seq_idx_t != kv_seq_idx_t
+        seq_pos_t = kv_seq_pos_t > q_seq_pos_t
+        attn_mask = (seq_idx_t | seq_pos_t) if self.is_causal else seq_idx_t
+        if self.is_pooler:
+            mask_v = torch.where(q_seq_pos_t < 0, True, False)
+            attn_mask = attn_mask | mask_v
+            off_value = -3E38  #small number, avoid nan and overflow
+        else:
+            off_value = -math.inf
+        attn_bias = torch.zeros_like(attn_mask, dtype=dtype)
+        attn_bias.masked_fill_(attn_mask, off_value)
+        return attn_bias.unsqueeze(1)
+
+    def set_causal_option(self, module):
+        if isinstance(module, HPUAttentionImpl) and hasattr(
+                module, 'attn_type'):
+            self.is_causal = not (
+                module.attn_type == AttentionType.ENCODER
+                or module.attn_type == AttentionType.ENCODER_ONLY
+                or module.attn_type == AttentionType.ENCODER_DECODER)
+            return
+        else:
+            for child_name, child_module in module.named_children():
+                self.set_causal_option(child_module)
+
+    def move_to_device(self, tensor):
+        return tensor if tensor is None else tensor.to(self.device,
+                                                       non_blocking=True)
+
     def _prepare_prompt(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
     ) -> PreparePromptMetadata:
         input_tokens: List[List[int]] = []
         input_positions: List[List[int]] = []
+        input_mrope_positions: List[List[List[int]]] = []
         slot_mapping: List[List[int]] = []
         lora_index_mapping: List[List[int]] = []
         lora_prompt_mapping: List[List[int]] = []
@@ -712,6 +1110,9 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         query_lens: List[int] = []
         prefix_block_tables: List[List[int]] = []
         multi_modal_kwargs_list: List[MultiModalKwargs] = []
+        multi_modal_placeholder_maps: Dict[
+            str, MultiModalPlaceholderMap] = collections.defaultdict(
+                MultiModalPlaceholderMap)
 
         if len(seq_group_metadata_list) == 0:
             return PreparePromptMetadata.empty()
@@ -745,6 +1146,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                     computed_block_nums) > 0 and self.sliding_window is None:
                 # Prefix is not supported with sliding_window
                 context_len = len(computed_block_nums) * self.block_size
+                if context_len == seq_len \
+                and self.vllm_config.cache_config.enable_prefix_caching:
+                    # Fully cached prompt - compute only last token
+                    context_len = context_len - 1
                 prompt_tokens = prompt_tokens[context_len:]
                 prefix_block_tables.append(computed_block_nums)
             elif self.scheduler_config.chunked_prefill_enabled:
@@ -769,10 +1174,43 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             # is always the first token in the sequence.
             input_positions.append(list(range(context_len, seq_len)))
 
-            mm_data = seq_group_metadata.multi_modal_data
-            if mm_data:
-                mm_kwargs = self.multi_modal_input_mapper(mm_data)
+            seq_data_mrope_positions: Optional[List[List[int]]] = None
+            if seq_group_metadata.multi_modal_data:
+                positions = input_positions[0]
+                mm_data, placeholder_maps = MultiModalPlaceholderMap \
+                    .from_seq_group(seq_group_metadata,
+                      range(positions[0], positions[0] + len(positions)))
+
+                if self.mm_registry.has_processor(self.model_config):
+                    mm_kwargs = mm_data
+                else:
+                    mm_kwargs = self.multi_modal_input_mapper(
+                        mm_data,
+                        seq_group_metadata.mm_processor_kwargs,
+                    )
+
+                # special processing for mrope position deltas.
+                if self.model_is_mrope:
+                    mrope_positions, mrope_position_delta = \
+                        self._get_mrope_positions_and_delta(
+                            seq_data=seq_data,
+                            mm_kwargs=mm_kwargs,
+                            context_len=context_len)
+                    assert mrope_positions is not None
+                    seq_data.mrope_position_delta = mrope_position_delta
+                    seq_data_mrope_positions = [[] for _ in range(3)]
+                    for idx in range(3):
+                        seq_data_mrope_positions[idx] \
+                            .extend(mrope_positions[idx])
+
                 multi_modal_kwargs_list.append(mm_kwargs)
+
+                for modality, placeholder_map in placeholder_maps.items():
+                    multi_modal_placeholder_maps[modality].extend(
+                        placeholder_map)
+
+            input_mrope_positions.append(
+                seq_data_mrope_positions)  # type: ignore
 
             if seq_group_metadata.block_tables is None:
                 # During memory profiling, the block tables are not initialized
@@ -799,19 +1237,22 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                 if i < start_idx:
                     slot_mapping[-1].append(_PAD_SLOT_ID)
                     continue
+                # For encoder-only models, the block_table is None,
+                # and there is no need to initialize the slot_mapping.
+                if block_table is not None:
+                    block_number = block_table[i // self.block_size]
+                    block_offset = i % self.block_size
+                    slot = block_number * self.block_size + block_offset
+                    slot_mapping[-1].append(slot)
 
-                block_number = block_table[i // self.block_size]
-                block_offset = i % self.block_size
-                slot = block_number * self.block_size + block_offset
-                slot_mapping[-1].append(slot)
-
-        max_query_len = max(query_lens)
-        sum_query_len = sum(query_lens)
+        if self.use_merged_prefill:
+            target_query_len = sum(query_lens)
+        else:
+            target_query_len = max(query_lens)
         real_num_seqs = len(query_lens)
-        assert max_query_len > 0
 
         max_prompt_len = max(
-            self.bucketing_ctx.get_padded_prompt_seq_len(max(seq_lens)),
+            self.bucketing_ctx.get_padded_prompt_seq_len(target_query_len),
             self.block_size)
 
         lora_ids: List[int] = []
@@ -826,8 +1267,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             lora_index_mapping += [lora_id] * max_prompt_len
             lora_prompt_mapping.extend(
                 [lora_id] *
-                (max_prompt_len
-                 if seq_group_metadata.sampling_params.prompt_logprobs else 1))
+                (max_prompt_len if seq_group_metadata.sampling_params and
+                 seq_group_metadata.sampling_params.prompt_logprobs else 1))
 
         if any(context_lens):
             assert not self.scheduler_config.chunked_prefill_enabled
@@ -851,44 +1292,62 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         else:
             prefix_block_list_tensor = None
 
-        input_tokens = make_tensor_with_pad(input_tokens,
-                                            max_len=max_prompt_len,
-                                            pad=0,
-                                            dtype=torch.long,
-                                            device='cpu')
+        input_tokens_tensor = make_cpu_tensor(input_tokens,
+                                              max_len=max_prompt_len,
+                                              pad=0,
+                                              dtype=torch.long,
+                                              flat=self.use_merged_prefill)
+        if self.model_is_mrope:
+            input_positions = \
+                make_mrope_positions_tensor_with_pad(input_positions=input_positions,
+                                                     input_mrope_positions=input_mrope_positions,
+                                                     max_prompt_len=max_prompt_len,
+                                                     pad=0)
+        else:
+            input_positions = make_cpu_tensor(input_positions,
+                                              max_len=max_prompt_len,
+                                              pad=0,
+                                              dtype=torch.long,
+                                              flat=self.use_merged_prefill)
 
-        input_positions = make_tensor_with_pad(input_positions,
-                                               max_len=max_prompt_len,
-                                               pad=0,
-                                               dtype=torch.long,
-                                               device='cpu')
+        slot_mapping = make_cpu_tensor(slot_mapping,
+                                       max_len=max_prompt_len,
+                                       pad=_PAD_SLOT_ID,
+                                       dtype=torch.long,
+                                       flat=self.use_merged_prefill)
 
-        slot_mapping = make_tensor_with_pad(slot_mapping,
-                                            max_len=max_prompt_len,
-                                            pad=_PAD_SLOT_ID,
-                                            dtype=torch.long,
-                                            device='cpu')
+        attn_bias = None
+        seq_lens_tensor = None
+        context_lens_tensor = None
 
+        if self.use_merged_prefill:
+            attn_bias = self.make_attn_bias(seq_lens, max_prompt_len,
+                                            self.model_config.dtype)
         seq_lens_tensor = torch.tensor(seq_lens,
                                        dtype=torch.long,
                                        device='cpu')
-
         context_lens_tensor = torch.tensor(context_lens,
                                            dtype=torch.long,
                                            device='cpu')
 
-        if prefix_block_list_tensor:
-            prefix_block_list_tensor = prefix_block_list_tensor.to(
-                self.device, non_blocking=True)
-        input_tokens = input_tokens.to(  # type: ignore
-            self.device, non_blocking=True)
-        input_positions = input_positions.to(  # type: ignore
-            self.device, non_blocking=True)
-        slot_mapping = slot_mapping.to(  # type: ignore
-            self.device, non_blocking=True)
-        seq_lens_tensor = seq_lens_tensor.to(self.device, non_blocking=True)
-        context_lens_tensor = context_lens_tensor.to(self.device,
-                                                     non_blocking=True)
+        placeholder_index_maps = {
+            modality: placeholder_map.index_map()
+            for modality, placeholder_map in
+            multi_modal_placeholder_maps.items()
+        }
+
+        # Note: num_prefill_tokens is calculated using the length of
+        # input_tokens after padding.
+        num_prefill_tokens = input_tokens_tensor.numel()
+
+        prefix_block_list_tensor = self.move_to_device(
+            prefix_block_list_tensor)
+        input_tokens_tensor = self.move_to_device(input_tokens_tensor)
+        input_positions = self.move_to_device(input_positions)
+        seq_lens_tensor = self.move_to_device(seq_lens_tensor)
+        slot_mapping = self.move_to_device(slot_mapping)
+        context_lens_tensor = self.move_to_device(context_lens_tensor)
+        attn_bias = self.move_to_device(attn_bias)
 
         attn_metadata = self.attn_backend.make_metadata(
             is_prompt=True,
@@ -897,21 +1356,26 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             block_usage=None,
             block_indices=None,
             block_offsets=None,
-            block_scales=None,
             block_groups=None,
-            attn_bias=None,
-            seq_lens_tensor=seq_lens_tensor,
+            attn_bias=attn_bias,
+            seq_lens=seq_lens,
+            seq_lens_tensor=self.move_to_device(seq_lens_tensor),
             context_lens_tensor=context_lens_tensor,
             num_prefills=real_num_seqs,
-            num_prefill_tokens=sum_query_len,
+            num_prefill_tokens=num_prefill_tokens,
             num_decode_tokens=0,
             slot_mapping=slot_mapping,
-            multi_modal_placeholder_index_maps=
-            None  # FIXME(kzawora): mutli-modality will not work here
+            multi_modal_placeholder_index_maps=placeholder_index_maps,
+            enable_kv_scales_calculation=False,
+            input_positions=input_positions,
         )
         multi_modal_kwargs = MultiModalKwargs.batch(multi_modal_kwargs_list)
+        for t in multi_modal_kwargs:
+            if torch.is_tensor(multi_modal_kwargs[t]):
+                multi_modal_kwargs[t] = multi_modal_kwargs[t].to(
+                    self.device, non_blocking=True)
 
-        return PreparePromptMetadata(input_tokens=input_tokens,
+        return PreparePromptMetadata(input_tokens=input_tokens_tensor,
                                      input_positions=input_positions,
                                      attn_metadata=attn_metadata,
                                      seq_lens=seq_lens,
@@ -930,13 +1394,17 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
     ) -> PrepareDecodeMetadata:
         input_tokens: List[List[int]] = []
         input_positions: List[List[int]] = []
+        input_mrope_positions: List[List[int]] = [[] for _ in range(3)]
         slot_mapping: List[List[int]] = []
         seq_lens: List[int] = []
+        encoder_seq_lens: List[int] = []
+        cross_block_tables: List[List[int]] = []
         block_tables: List[List[int]] = []
         lora_index_mapping: List[List[int]] = []
         lora_prompt_mapping: List[List[int]] = []
         lora_requests: Set[LoRARequest] = set()
 
+        is_enc_dec_model = self.model_config.is_encoder_decoder
         if len(seq_group_metadata_list) == 0:
             return PrepareDecodeMetadata.empty()
         lora_ids: List[int] = []
@@ -951,6 +1419,15 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             seq_ids = list(seq_group_metadata.seq_data.keys())
             lora_id = seq_group_metadata.lora_int_id
             lora_ids.append(lora_id)
+            if is_enc_dec_model:
+                for _ in range(len(seq_group_metadata.seq_data)):
+                    encoder_seq_len = (
+                        seq_group_metadata.encoder_seq_data.get_len()
+                        if seq_group_metadata.encoder_seq_data else 0)
+                    encoder_seq_lens.append(encoder_seq_len)
+                    cross_block_table = seq_group_metadata.cross_block_table
+                    cross_block_tables.append([] if (
+                        cross_block_table is None) else cross_block_table)
 
             if lora_id > 0:
                 lora_requests.add(seq_group_metadata.lora_request)
@@ -964,6 +1441,18 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                 seq_len = seq_data.get_len()
                 position = seq_len - 1
                 input_positions.append([position])
+
+                if self.model_is_mrope:
+                    if seq_data.mrope_position_delta is not None:
+                        pos_for_mrope = MRotaryEmbedding \
+                            .get_next_input_positions(
+                                seq_data.mrope_position_delta,
+                                seq_data.get_num_computed_tokens(),
+                                seq_len)
+                    else:
+                        pos_for_mrope = [[position]] * 3
+                    for idx in range(3):
+                        input_mrope_positions[idx].extend(pos_for_mrope[idx])
 
                 seq_len = seq_len if self.sliding_window is None else min(
                     seq_len, self.sliding_window)
@@ -998,13 +1487,14 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                         device='cpu')
         else:
             real_batch_size = len(seq_group_metadata_list)
-            input_tokens = output[:real_batch_size]
+            input_tokens = output[:real_batch_size].clone()
 
-        input_positions = torch.tensor(input_positions,
-                                       dtype=torch.long,
-                                       device='cpu')
+        input_positions = torch.tensor(
+            input_mrope_positions if self.model_is_mrope else input_positions,
+            dtype=torch.long,
+            device='cpu')
 
-        num_decode_tokens = sum(seq_lens)
+        num_decode_tokens = len(seq_lens)
 
         last_block_usage = [
             slot[0] % self.block_size + 1 for slot in slot_mapping
@@ -1020,6 +1510,30 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
 
         assert len(block_list) == len(block_groups)
         assert len(block_list) == len(block_usage)
+
+        if is_enc_dec_model:
+            last_cross_block_usage = [
+                (encoder_seq_len - 1) % self.block_size + 1
+                for encoder_seq_len in encoder_seq_lens
+            ]
+            cross_block_groups = [[i] * len(bt)
+                                  for i, bt in enumerate(cross_block_tables)]
+            cross_block_usage = [
+                [self.block_size] * (len(bt) - 1) + [lbu]
+                for bt, lbu in zip(cross_block_tables, last_cross_block_usage)
+                if bt
+            ]
+            cross_block_list = flatten(cross_block_tables)
+            cross_block_groups = flatten(cross_block_groups)
+            cross_block_usage = flatten(cross_block_usage)
+            assert len(cross_block_list) == len(cross_block_groups)
+            assert len(cross_block_list) == len(cross_block_usage)
+
+        else:
+            cross_block_list = None
+            cross_block_groups = None
+            cross_block_usage = None
+            encoder_seq_lens_tensor = None
 
         padding_fn = None
         if self.use_contiguous_pa:
@@ -1041,6 +1555,50 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         block_list = padding_fn(block_list, _PAD_BLOCK_ID)
         block_groups = padding_fn(block_groups, -1)
         block_usage = padding_fn(block_usage, 1)
+
+        if is_enc_dec_model:
+            if self.use_contiguous_pa:
+                cross_block_bucket_size = max(
+                    max(cross_block_list) +
+                    1, len(cross_block_list)) if cross_block_list else 0
+                cross_block_bucket_size = \
+                    self.bucketing_ctx.get_padded_decode_num_blocks(
+                    cross_block_bucket_size)
+                indices = [None] * cross_block_bucket_size
+                for i, bid in enumerate(cross_block_list):
+                    indices[bid] = i
+                padding_fn = lambda tensor, pad_value: gather_list(
+                    tensor, indices, pad_value)
+            else:
+                cross_block_bucket_size = \
+                    self.bucketing_ctx.get_padded_decode_num_blocks(
+                    len(cross_block_list))
+                padding_fn = lambda tensor, pad_value: pad_list(
+                    tensor, cross_block_bucket_size, pad_value)
+
+            real_batch_size = len(seq_group_metadata_list)
+            batch_size_padded = self.bucketing_ctx.get_padded_batch_size(
+                real_batch_size, False)
+            batch_size_padding = batch_size_padded - real_batch_size
+            if batch_size_padding > 0:
+                encoder_seq_lens.extend(encoder_seq_lens[0]
+                                        for _ in range(batch_size_padding))
+            cross_block_list = padding_fn(cross_block_list, _PAD_BLOCK_ID)
+            cross_block_groups = padding_fn(cross_block_groups, -1)
+            cross_block_usage = padding_fn(cross_block_usage, 1)
+
+            cross_block_list = torch.tensor(cross_block_list,
+                                            dtype=torch.int,
+                                            device='cpu')
+            cross_block_groups = torch.tensor(cross_block_groups,
+                                              dtype=torch.int,
+                                              device='cpu')
+            cross_block_usage = torch.tensor(cross_block_usage,
+                                             dtype=self.model_config.dtype,
+                                             device='cpu')
+            encoder_seq_lens_tensor = torch.tensor(encoder_seq_lens,
+                                                   dtype=torch.long,
+                                                   device='cpu')
 
         block_list = torch.tensor(block_list, dtype=torch.int, device='cpu')
         block_groups = torch.tensor(block_groups,
@@ -1065,6 +1623,15 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             self.device, non_blocking=True)
         slot_mapping = slot_mapping.to(  # type: ignore
             self.device, non_blocking=True)
+        if is_enc_dec_model:
+            cross_block_list = cross_block_list.to(  # type: ignore
+                self.device, non_blocking=True)
+            cross_block_groups = cross_block_groups.to(  # type: ignore
+                self.device, non_blocking=True)
+            cross_block_usage = cross_block_usage.to(  # type: ignore
+                self.device, non_blocking=True)
+            encoder_seq_lens_tensor = encoder_seq_lens_tensor.to(  # type: ignore
+                self.device, non_blocking=True)
 
         attn_metadata = self.attn_backend.make_metadata(
             is_prompt=False,
@@ -1073,16 +1640,22 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             block_usage=block_usage,
             block_indices=None,
             block_offsets=None,
-            block_scales=None,
             block_groups=block_groups,
             attn_bias=None,
             seq_lens_tensor=None,
+            encoder_seq_lens=encoder_seq_lens,
+            encoder_seq_lens_tensor=encoder_seq_lens_tensor,
+            cross_block_list=cross_block_list,
+            cross_block_groups=cross_block_groups,
+            cross_block_usage=cross_block_usage,
             context_lens_tensor=None,
             num_prefills=0,
             num_prefill_tokens=0,
             num_decode_tokens=num_decode_tokens,
             slot_mapping=slot_mapping,
-            multi_modal_placeholder_index_maps=None)
+            multi_modal_placeholder_index_maps=None,
+            enable_kv_scales_calculation=False,
+            input_positions=input_positions)
         return PrepareDecodeMetadata(input_tokens=input_tokens,
                                      input_positions=input_positions,
                                      attn_metadata=attn_metadata,
@@ -1095,6 +1668,7 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
     def prepare_input_tensors(
         self,
         seq_group_metadata_list: List[SequenceGroupMetadata],
+        finished_requests_ids: Optional[List[str]] = None
     ) -> Tuple[TModelInputForHPU, SamplingMetadata]:
         if len(seq_group_metadata_list) == 0:
             return self._model_input_cls(), None
@@ -1115,16 +1689,8 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         base_event_name = 'prompt' if is_prompt else 'decode'
         self.profiler.start('internal', base_event_name)
 
-        real_batch_size = len(seq_group_metadata_list)
-        batch_size_padded = self.bucketing_ctx.get_padded_batch_size(
-            real_batch_size, is_prompt)
-        batch_size_padding = batch_size_padded - real_batch_size
-        seq_group_metadata_list = seq_group_metadata_list.copy()
-        if batch_size_padding > 0:
-            dummy_seq_group_metadata = self.create_dummy_seq_group_metadata(
-                0, 0, is_prompt)
-            seq_group_metadata_list.extend(dummy_seq_group_metadata
-                                           for _ in range(batch_size_padding))
+        seq_group_metadata_list, real_batch_size, batch_size_padded = (
+            self._add_dummy_seq(seq_group_metadata_list, is_prompt))
 
         prefill_reqs = []
         decode_reqs = []
@@ -1158,10 +1724,16 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             decode_slot_mapping,
             decode_lora_ids,
         ) = self._prepare_decode(decode_reqs)
-        sampling_metadata = SamplingMetadata.prepare(seq_group_metadata_list,
-                                                     seq_lens, query_lens,
-                                                     self.device,
-                                                     self.pin_memory)
+
+        if not self.is_pooler:
+            generators = self.get_generators(finished_requests_ids)
+            sampling_metadata = SamplingMetadata.prepare(
+                seq_group_metadata_list,
+                seq_lens,
+                query_lens,
+                self.device,
+                self.pin_memory,
+                generators=generators)
 
         if not self.scheduler_config.chunked_prefill_enabled:
             assert (len(prefill_reqs) and len(decode_reqs)) == 0
@@ -1185,22 +1757,32 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             lora_requests = decode_lora_requests
             lora_ids = decode_lora_ids
 
-        # FIXME: We need to adjust selected_token_indices to accommodate
-        # for padding
-        max_len = input_tokens.size(1)
-        paddings = [max_len - q for q in query_lens]
-        paddings = [0] + paddings[:-1]
-        paddings = list(itertools.accumulate(paddings))
-        paddings_prompt_logprobs = []
-        for i, seq_group_metadata in enumerate(seq_group_metadata_list):
-            if seq_group_metadata.sampling_params.prompt_logprobs is not None \
-                              and seq_group_metadata.is_prompt:
-                paddings_prompt_logprobs += ([paddings[i]] * seq_lens[i])
-        paddings = torch.tensor(
-            paddings_prompt_logprobs if paddings_prompt_logprobs else paddings,
-            dtype=sampling_metadata.selected_token_indices.dtype,
-            device=sampling_metadata.selected_token_indices.device)
-        sampling_metadata.selected_token_indices.add_(paddings)
+        if self.is_pooler:
+            sampling_metadata = None
+        elif not self.use_merged_prefill:
+            # FIXME: We need to adjust selected_token_indices to accommodate
+            # for padding
+            max_len = input_tokens.size(1)
+            paddings = [max_len - q for q in query_lens]
+            paddings = [0] + paddings[:-1]
+            paddings = list(itertools.accumulate(paddings))
+            paddings_prompt_logprobs = []
+
+            if not self.is_pooler:
+                for i, seq_group_metadata in enumerate(
+                        seq_group_metadata_list):
+                    if seq_group_metadata.sampling_params \
+                        and seq_group_metadata.sampling_params.prompt_logprobs \
+                            is not None and seq_group_metadata.is_prompt:
+                        paddings_prompt_logprobs += ([paddings[i]] *
+                                                     seq_lens[i])
+
+                paddings = torch.tensor(
+                    paddings_prompt_logprobs
+                    if paddings_prompt_logprobs else paddings,
+                    dtype=sampling_metadata.selected_token_indices.dtype,
+                    device=sampling_metadata.selected_token_indices.device)
+                sampling_metadata.selected_token_indices.add_(paddings)
 
         if self.lora_config:
             lora_mapping = LoRAMapping(
@@ -1220,19 +1802,33 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             batch_type = BatchType.DECODE
 
         metadata_dict = {
-            "input_tokens": input_tokens,
-            "input_positions": input_positions,
-            "selected_token_indices": sampling_metadata.selected_token_indices,
-            "lora_requests": lora_requests,
-            "lora_mapping": lora_mapping,
-            "multi_modal_kwargs": multi_modal_kwargs,
-            "num_prefill_tokens": num_prefill_tokens,
-            "num_decode_tokens": num_decode_tokens,
-            "slot_mapping": slot_mapping,
-            "num_prefills": num_prefills,
-            "batch_type": batch_type,
-            "seq_lens": seq_lens,
-            "query_lens": query_lens
+            "input_tokens":
+            input_tokens,
+            "input_positions":
+            input_positions,
+            "selected_token_indices":
+            sampling_metadata.selected_token_indices
+            if sampling_metadata else None,
+            "lora_requests":
+            lora_requests,
+            "lora_mapping":
+            lora_mapping,
+            "multi_modal_kwargs":
+            multi_modal_kwargs,
+            "num_prefill_tokens":
+            num_prefill_tokens,
+            "num_decode_tokens":
+            num_decode_tokens,
+            "slot_mapping":
+            slot_mapping,
+            "num_prefills":
+            num_prefills,
+            "batch_type":
+            batch_type,
+            "seq_lens":
+            seq_lens,
+            "query_lens":
+            query_lens
         }
         if prefill_attn_metadata is not None:
             metadata_dict.update(prefill_attn_metadata.asdict_zerocopy())
@@ -1255,6 +1851,76 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                      batch_size_padded=batch_size_padded,
                                      lora_ids=lora_ids), \
                                         sampling_metadata
+
+    def create_lora_mask(self, input_tokens: torch.Tensor, lora_ids: List[int],
+                         is_prompt: bool):
+        '''
+        This is a helper function to create the mask for lora computations.
+        Lora Mask is needed to ensure we match the correct lora weights for the
+        for the request.
+        For Prompt phase we have
+        lora_mask with shape (batch_size * seq_len, max_loras * max_rank)
+        lora_logits_mask with shape (batch_size, max_loras * max_rank)
+        For Decode phase we have both
+        lora_mask and lora_logits_mask with shape
+        (batch_size, max_loras * max_rank)
+        '''
+        lora_mask: torch.Tensor = None
+        lora_logits_mask: torch.Tensor = None
+        lora_index = 0
+
+        if self.lora_config:
+            if is_prompt:
+                lora_mask = torch.zeros(
+                    input_tokens.shape[0] * input_tokens.shape[1],
+                    (self.lora_config.max_loras) *\
+                        self.lora_config.max_lora_rank,
+                    dtype=self.lora_config.lora_dtype)
+                lora_logits_mask = torch.zeros(
+                    input_tokens.shape[0], (self.lora_config.max_loras) *
+                    self.lora_config.max_lora_rank,
+                    dtype=self.lora_config.lora_dtype)
+
+                ones = torch.ones(input_tokens.shape[1],
+                                  self.lora_config.max_lora_rank,
+                                  dtype=self.lora_config.lora_dtype)
+                logit_ones = torch.ones(1,
+                                        self.lora_config.max_lora_rank,
+                                        dtype=self.lora_config.lora_dtype)
+
+                for i in range(len(lora_ids)):
+                    if lora_ids[i] == 0:
+                        continue
+                    lora_index = self.lora_manager._adapter_manager.\
+                        lora_index_to_id.index(lora_ids[i])
+                    start_row = i * input_tokens.shape[1]
+                    end_row = start_row + input_tokens.shape[1]
+                    start_col = lora_index * self.lora_config.max_lora_rank
+                    end_col = start_col + self.lora_config.max_lora_rank
+                    lora_mask[start_row:end_row, start_col:end_col] = ones
+                    lora_logits_mask[i, start_col:end_col] = logit_ones
+                lora_mask = lora_mask.to('hpu')
+                lora_logits_mask = lora_logits_mask.to('hpu')
+            else:
+                lora_mask = torch.zeros(input_tokens.shape[0],
+                                        (self.lora_config.max_loras) *
+                                        self.lora_config.max_lora_rank,
+                                        dtype=self.lora_config.lora_dtype)
+                ones = torch.ones(1,
+                                  self.lora_config.max_lora_rank,
+                                  dtype=self.lora_config.lora_dtype)
+                for i in range(len(lora_ids)):
+                    if lora_ids[i] == 0:
+                        continue
+                    lora_index = self.lora_manager._adapter_manager.\
+                        lora_index_to_id.index(lora_ids[i])
+                    start_pos = lora_index * self.lora_config.max_lora_rank
+                    end_pos = start_pos + self.lora_config.max_lora_rank
+                    lora_mask[i, start_pos:end_pos] = ones
+                lora_mask = lora_mask.to('hpu')
+                lora_logits_mask = lora_mask
+
+        return lora_mask, lora_logits_mask
 
     def _seq_len(self, attn_metadata):
         if attn_metadata.num_prefills != 0:
@@ -1284,10 +1950,18 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         # input_hash(123) != input_hash(321)
         # input_hash("abc") != input_hash("cba")
         attention_metadata = subtuple(metadata, 'TrimmedAttentionMetadata', [
-            'attn_bias', 'seq_lens_tensor', 'context_lens_tensor',
-            'block_list', 'block_mapping', 'block_usage', 'slot_mapping',
-            'is_prompt', 'block_indices', 'block_offsets', 'block_scales',
-            'block_groups'
+            'attn_bias',
+            'seq_lens_tensor',
+            'context_lens_tensor',
+            'block_list',
+            'block_mapping',
+            'block_usage',
+            'slot_mapping',
+            'is_prompt',
+            'block_indices',
+            'block_offsets',
+            'block_groups',
+            'input_positions',
         ])
         return attention_metadata
 
@@ -1297,8 +1971,11 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
                                         is_prompt,
                                         lora_request=None,
                                         temperature=0):
-        sampling_params = SamplingParams(temperature=temperature)
-        num_blocks = math.ceil(seq_len / self.block_size)
+        if self.is_pooler:
+            sampling_params = None
+        else:
+            sampling_params = SamplingParams(temperature=temperature)
+            num_blocks = math.ceil(seq_len / self.block_size)
         seq_len = max(seq_len, 1)
         if is_prompt:
             input_len = seq_len
@@ -1323,10 +2000,12 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
     def profile_run(self) -> None:
         num_layers = self.model_config.get_num_layers(self.parallel_config)
         kv_caches = [None] * num_layers
+        bind_kv_cache(
+            self.vllm_config.compilation_config.static_forward_context,
+            [kv_caches] * self.parallel_config.pipeline_parallel_size)
         _, max_seq_len = self.bucketing_ctx.get_max_prompt_shape()
         max_batch_size = min(self.max_num_seqs,
                              self.max_num_batched_tokens // max_seq_len)
-
         self.warmup_scenario(max_batch_size, max_seq_len, True, kv_caches,
                              False, True)
         return
@@ -1398,12 +2077,30 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         if is_pt_profiler_run and self.is_driver_worker:
             profiler = setup_profiler()
             profiler.start()
-        for _ in range(times):
+        for time_index in range(times):
             inputs = self.prepare_model_input(seqs)
+            # Chendi: Necessary fix for warmup with TP>1
+            if time_index == 0:
+                if self.is_driver_worker:
+                    broadcast_tensor_dict(
+                        {"input_tokens": inputs.input_tokens}, src=0)
+                else:
+                    broadcast_tensor_dict(src=0)
             is_single_step = \
                 self.vllm_config.scheduler_config.num_scheduler_steps == 1
             if is_prompt or is_single_step:
-                self.execute_model(inputs, kv_caches, warmup_mode=True)
+                intermediate_tensors = None
+                if not get_pp_group().is_first_rank:
+                    intermediate_tensors = \
+                        self.model.make_empty_intermediate_tensors(
+                            batch_size=batch_size,
+                            context_size=seq_len if is_prompt else 1,
+                            dtype=self.model_config.dtype,
+                            device=self.device)
+                self.execute_model(inputs,
+                                   kv_caches,
+                                   intermediate_tensors=intermediate_tensors,
+                                   warmup_mode=True)
             else:  # decode with multi-step
                 inputs = dataclasses.replace(inputs,
                                              is_first_multi_step=True,
@@ -1545,6 +2242,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
 
     @torch.inference_mode()
     def warmup_model(self, kv_caches: List[torch.Tensor]) -> None:
+        if not self.is_pooler:
+            max_blocks = kv_caches[0][0].size(0)
+            self.bucketing_ctx.generate_decode_buckets(max_blocks)
+
         if profile := os.environ.get('VLLM_PT_PROFILE', None):
             phase, bs, seq_len, graph = profile.split('_')
             is_prompt = phase == 'prompt'
@@ -1554,16 +2255,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             self.warmup_scenario(int(bs), int(seq_len), is_prompt, kv_caches,
                                  True)
             raise AssertionError("Finished profiling")
-        if self.skip_warmup:
-            logger.info("Skipping warmup...")
-            return
-        self.profiler.start('internal', 'warmup')
-        max_blocks = kv_caches[0][0].size(0)
-        self.bucketing_ctx.generate_prompt_buckets()
-        self.bucketing_ctx.generate_decode_buckets(max_blocks)
-
         if not htorch.utils.internal.is_lazy() and not self.enforce_eager:
-            cache_size_limit = 1 + 3 * (
+            multiplier = 3 if os.getenv('VLLM_REGIONAL_COMPILATION',
+                                        'true').lower() == 'true' else 1
+            cache_size_limit = 1 + multiplier * (
                 len(self.bucketing_ctx.prompt_buckets) +
                 len(self.bucketing_ctx.decode_buckets))
             torch._dynamo.config.cache_size_limit = max(
@@ -1573,7 +2268,10 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             torch._dynamo.config.accumulated_cache_size_limit = max(
                 cache_size_limit * 8,
                 torch._dynamo.config.accumulated_cache_size_limit)
-
+        if self.skip_warmup:
+            logger.info("Skipping warmup...")
+            return
+        self.profiler.start('internal', 'warmup')
         start_mem = HabanaMemoryProfiler.current_device_memory_usage()
         start_time = time.perf_counter()
 
@@ -1594,72 +2292,107 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
         ) if can_use_compile_only_mode else contextlib.nullcontext():
             self.warmup_all_buckets(self.bucketing_ctx.prompt_buckets, True,
                                     kv_caches)
-            self.warmup_all_buckets(self.bucketing_ctx.decode_buckets, False,
-                                    kv_caches)
+            if not self.is_pooler:
+                self.warmup_all_buckets(self.bucketing_ctx.decode_buckets,
+                                        False, kv_caches)
 
             if not self.enforce_eager and htorch.utils.internal.is_lazy():
-                assert self.mem_margin is not None, \
-                    ("HabanaWorker.determine_num_available_blocks needs "
-                    "to be called before warming up the model.")
+                if not self.is_pooler:
+                    assert self.mem_margin is not None, \
+                        ("HabanaWorker.determine_num_available_blocks needs "
+                        "to be called before warming up the model.")
+
                 free_mem = HabanaMemoryProfiler.current_free_device_memory()
                 graph_free_mem = free_mem - self.mem_margin
                 graph_free_mem = align_workers(graph_free_mem,
                                                torch.distributed.ReduceOp.MIN)
-                prompt_graph_mem_ratio = float(
-                    os.environ.get('VLLM_GRAPH_PROMPT_RATIO', '0.3'))
-                prompt_available_memory = (prompt_graph_mem_ratio *
-                                           graph_free_mem)
-                decode_available_memory = (graph_free_mem -
-                                           prompt_available_memory)
-                msg = (
-                    f"Using {format_bytes(graph_free_mem)}"
-                    f"/{format_bytes(free_mem)} "
-                    "of free device memory for HPUGraphs, "
-                    f"{format_bytes(prompt_available_memory)} for prompt and "
-                    f"{format_bytes(decode_available_memory)} for decode "
-                    f"(VLLM_GRAPH_PROMPT_RATIO={prompt_graph_mem_ratio})")
-                logger.info(msg)
                 prompt_strategy = os.environ.get('VLLM_GRAPH_PROMPT_STRATEGY',
                                                  'min_tokens')
-                decode_strategy = os.environ.get('VLLM_GRAPH_DECODE_STRATEGY',
-                                                 'max_bs')
-                mem_post_prompt, prompt_batch_seq, prompt_captured_all = \
-                    self.warmup_graphs(
-                    prompt_strategy, self.bucketing_ctx.prompt_buckets,
-                    True, kv_caches, prompt_available_memory)
-                mem_post_decode, decode_batch_seq, decode_captured_all = \
-                    self.warmup_graphs(
-                    decode_strategy, self.bucketing_ctx.decode_buckets,
-                    False, kv_caches, decode_available_memory)
-
-                # Not all prompt buckets were captured, but all decode buckets
-                # were captured and we have some free graph-allocated space
-                # left. Let's try to use it for capturing more prompt buckets.
-                if (mem_post_decode + mem_post_prompt < graph_free_mem
-                        and not prompt_captured_all and decode_captured_all):
-                    mem_post_prompt, _, prompt_captured_all = (
+                if not self.is_pooler:
+                    prompt_graph_mem_ratio = float(
+                        os.environ.get('VLLM_GRAPH_PROMPT_RATIO', '0.3'))
+                    prompt_available_memory = (prompt_graph_mem_ratio *
+                                               graph_free_mem)
+                    decode_available_memory = (graph_free_mem -
+                                               prompt_available_memory)
+                    msg = (
+                        f"Using {format_bytes(graph_free_mem)}"
+                        f"/{format_bytes(free_mem)} "
+                        "of free device memory for HPUGraphs, "
+                        f"{format_bytes(prompt_available_memory)} \
+                            for prompt and "
+                        f"{format_bytes(decode_available_memory)} for decode "
+                        f"(VLLM_GRAPH_PROMPT_RATIO={prompt_graph_mem_ratio})")
+                    logger.info(msg)
+                    mem_post_prompt, prompt_batch_seq, prompt_captured_all = \
                         self.warmup_graphs(
-                            prompt_strategy, self.bucketing_ctx.prompt_buckets,
-                            True, kv_caches,
-                            graph_free_mem - mem_post_prompt - mem_post_decode,
-                            mem_post_prompt, prompt_batch_seq))
+                        prompt_strategy, self.bucketing_ctx.prompt_buckets,
+                        True, kv_caches, prompt_available_memory)
 
-                # Not all decode buckets were captured, but all prompt buckets
-                # were captured and we have some free graph-allocated space
-                # left. Let's try to use it for capturing more decode buckets.
-                if mem_post_decode + mem_post_prompt < graph_free_mem \
-                    and not decode_captured_all \
-                        and prompt_captured_all:
-                    mem_post_decode, _, _ = self.warmup_graphs(
+                    decode_strategy = os.environ.get(
+                        'VLLM_GRAPH_DECODE_STRATEGY', 'max_bs')
+                    mem_post_decode, decode_batch_seq, decode_captured_all = \
+                        self.warmup_graphs(
                         decode_strategy, self.bucketing_ctx.decode_buckets,
-                        False, kv_caches,
-                        graph_free_mem - mem_post_prompt - mem_post_decode,
-                        mem_post_decode, decode_batch_seq)
+                        False, kv_caches, decode_available_memory)
+
+                    # Not all prompt buckets were captured, but all decode
+                    # buckets were captured and we have some free
+                    # graph-allocated space left. Let's try to use it for
+                    # capturing more prompt buckets.
+                    if (mem_post_decode + mem_post_prompt < graph_free_mem
+                            and not prompt_captured_all
+                            and decode_captured_all):
+                        mem_post_prompt, _, prompt_captured_all = (
+                            self.warmup_graphs(
+                                prompt_strategy,
+                                self.bucketing_ctx.prompt_buckets, True,
+                                kv_caches, graph_free_mem - mem_post_prompt -
+                                mem_post_decode, mem_post_prompt,
+                                prompt_batch_seq))
+                        # Not all decode buckets were captured, but all prompt
+                        # buckets were captured and we have some free
+                        # graph-allocated space left. Let's try to use it for
+                        # capturing more decode buckets.
+                        if mem_post_decode + mem_post_prompt < graph_free_mem \
+                            and not decode_captured_all \
+                                and prompt_captured_all:
+                            mem_post_decode, _, _ = self.warmup_graphs(
+                                decode_strategy,
+                                self.bucketing_ctx.decode_buckets, False,
+                                kv_caches, graph_free_mem - mem_post_prompt -
+                                mem_post_decode, mem_post_decode,
+                                decode_batch_seq)
+                else:
+                    prompt_available_memory = graph_free_mem
+                    msg = (
+                        f"Using {format_bytes(graph_free_mem)}"
+                        f"/{format_bytes(free_mem)} "
+                        "of free device memory for HPUGraphs, "
+                        f"{format_bytes(prompt_available_memory)} for prompt")
+                    logger.info(msg)
+                    prompt_strategy = os.environ.get(
+                        'VLLM_GRAPH_PROMPT_STRATEGY', 'min_tokens')
+
+                    mem_post_prompt, prompt_batch_seq, prompt_captured_all = \
+                        self.warmup_graphs(
+                        prompt_strategy, self.bucketing_ctx.prompt_buckets,
+                        True, kv_caches, prompt_available_memory)
+                    if mem_post_prompt < graph_free_mem \
+                        and not prompt_captured_all:
+                        mem_post_prompt, _, prompt_captured_all = (
+                            self.warmup_graphs(
+                                prompt_strategy,
+                                self.bucketing_ctx.prompt_buckets, True,
+                                kv_caches, graph_free_mem - mem_post_prompt,
+                                mem_post_prompt, prompt_batch_seq))
 
                 self.log_graph_warmup_summary(
                     self.bucketing_ctx.prompt_buckets, True, mem_post_prompt)
-                self.log_graph_warmup_summary(
-                    self.bucketing_ctx.decode_buckets, False, mem_post_decode)
+                if not self.is_pooler:
+                    self.log_graph_warmup_summary(
+                        self.bucketing_ctx.decode_buckets, False,
+                        mem_post_decode)
 
         end_time = time.perf_counter()
         end_mem = HabanaMemoryProfiler.current_device_memory_usage()
@@ -1669,6 +2402,21 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
             f"allocated {format_bytes(end_mem - start_mem)} of device memory")
         logger.info(msg)
         self.profiler.end()
+
+    def finish_measurements(self):
+        from neural_compressor.torch.quantization import finalize_calibration
+        finalize_calibration(self.model.model)
+
+    def shutdown_inc(self):
+        can_finalize_inc = self._is_quant_with_inc() and \
+            (self.model.model is not None) and \
+            self.inc_initialized_successfully and \
+            not getattr(self, "_is_inc_finalized", False)
+        if can_finalize_inc:
+            from neural_compressor.torch.quantization import (
+                finalize_calibration)
+            finalize_calibration(self.model.model)
+            self._is_inc_finalized = True
 
     @property
     def vocab_size(self) -> int:
@@ -1681,12 +2429,6 @@ class HPUModelRunnerBase(ModelRunnerBase[TModelInputForHPU]):
     @mem_margin.setter
     def mem_margin(self, value):
         self._mem_margin = value
-
-
-def _maybe_wrap_in_hpu_graph(*args, **kwargs):
-    return htorch.hpu.wrap_in_hpu_graph(
-        HpuModelAdapter(*args, **kwargs), disable_tensor_cache=True
-    ) if htorch.utils.internal.is_lazy() else HpuModelAdapter(*args, **kwargs)
 
 
 class HabanaProfilerCounterHelper:
@@ -1778,15 +2520,6 @@ class HabanaProfilerCounterHelper:
         return counters
 
 
-def unwrap_model(model):
-    if isinstance(model, torch._dynamo.eval_frame.OptimizedModule):
-        return unwrap_model(model._orig_mod)
-    else:
-        model = list(vars(model)['_modules'].values())[0]
-        modules = list(vars(model)['_modules'].values())
-        return modules
-
-
 class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
     """
     GPU model runner with sampling step.
@@ -1826,7 +2559,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                 self.profiler_counter_helper.capture_seq_group_metadata_stats(
                     seq_group_metadata_list=seq_group_metadata_list)
             model_input, sampling_metadata = self.prepare_input_tensors(
-                seq_group_metadata_list)
+                seq_group_metadata_list, finished_requests_ids)
             assert model_input.attn_metadata is not None
             is_prompt = model_input.attn_metadata.is_prompt
 
@@ -1835,84 +2568,20 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                                    is_prompt=is_prompt,
                                    virtual_engine=virtual_engine)
 
-    def _check_config(self, batch_size, seq_len, is_prompt, warmup_mode):
-        cfg = (batch_size, seq_len, is_prompt)
-        seen = cfg in self.seen_configs
-        self.seen_configs.add(cfg)
-        if not seen and not warmup_mode:
-            phase = 'prompt' if is_prompt else 'decode'
-            logger.warning("Configuration: (%s, %s, %s) was not warmed-up!",
-                           phase, batch_size, seq_len)
+    def _get_seq_ids(self, model_input):
+        return ([
+            sg.seq_ids[0] for sg in model_input.sampling_metadata.seq_groups
+        ])
 
-    def create_lora_mask(self, input_tokens: torch.Tensor, lora_ids: List[int],
-                         is_prompt: bool):
-        '''
-        This is a helper function to create the mask for lora computations.
-        Lora Mask is needed to ensure we match the correct lora weights for the
-        for the request.
-        For Prompt phase we have 
-        lora_mask with shape (batch_size * seq_len, max_loras * max_rank)
-        lora_logits_mask with shape (batch_size, max_loras * max_rank)
-        For Decode phase we have both
-        lora_mask and lora_logits_mask with shape
-        (batch_size, max_loras * max_rank)
-        '''
-        lora_mask: torch.Tensor = None
-        lora_logits_mask: torch.Tensor = None
-        lora_index = 0
-
-        if self.lora_config:
-            if is_prompt:
-                lora_mask = torch.zeros(
-                    input_tokens.shape[0] * input_tokens.shape[1],
-                    (self.lora_config.max_loras) *\
-                        self.lora_config.max_lora_rank,
-                    dtype=self.lora_config.lora_dtype)
-                lora_logits_mask = torch.zeros(
-                    input_tokens.shape[0], (self.lora_config.max_loras) *
-                    self.lora_config.max_lora_rank,
-                    dtype=self.lora_config.lora_dtype)
-
-                ones = torch.ones(input_tokens.shape[1],
-                                  self.lora_config.max_lora_rank,
-                                  dtype=self.lora_config.lora_dtype)
-                logit_ones = torch.ones(1,
-                                        self.lora_config.max_lora_rank,
-                                        dtype=self.lora_config.lora_dtype)
-
-                for i in range(len(lora_ids)):
-                    if lora_ids[i] == 0:
-                        continue
-                    lora_index = self.lora_manager._adapter_manager.\
-                        lora_index_to_id.index(lora_ids[i])
-                    start_row = i * input_tokens.shape[1]
-                    end_row = start_row + input_tokens.shape[1]
-                    start_col = lora_index * self.lora_config.max_lora_rank
-                    end_col = start_col + self.lora_config.max_lora_rank
-                    lora_mask[start_row:end_row, start_col:end_col] = ones
-                    lora_logits_mask[i, start_col:end_col] = logit_ones
-                lora_mask = lora_mask.to('hpu')
-                lora_logits_mask = lora_logits_mask.to('hpu')
-            else:
-                lora_mask = torch.zeros(input_tokens.shape[0],
-                                        (self.lora_config.max_loras) *
-                                        self.lora_config.max_lora_rank,
-                                        dtype=self.lora_config.lora_dtype)
-                ones = torch.ones(1,
-                                  self.lora_config.max_lora_rank,
-                                  dtype=self.lora_config.lora_dtype)
-                for i in range(len(lora_ids)):
-                    if lora_ids[i] == 0:
-                        continue
-                    lora_index = self.lora_manager._adapter_manager.\
-                        lora_index_to_id.index(lora_ids[i])
-                    start_pos = lora_index * self.lora_config.max_lora_rank
-                    end_pos = start_pos + self.lora_config.max_lora_rank
-                    lora_mask[i, start_pos:end_pos] = ones
-                lora_mask = lora_mask.to('hpu')
-                lora_logits_mask = lora_mask
-
-        return lora_mask, lora_logits_mask
+    def _pad_to_max_num_seqs(self, tensor, value):
+        padding_needed = self.max_num_seqs - tensor.size(0)
+        if padding_needed:
+            padding = torch.full((padding_needed, *tensor.shape[1:]),
+                                 value,
+                                 device=tensor.device,
+                                 dtype=tensor.dtype)
+            tensor = torch.cat([tensor, padding])
+        return tensor
 
     @torch.inference_mode()
     def execute_model(
@@ -1925,6 +2594,39 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
         previous_hidden_states: Optional[torch.Tensor] = None,
         seqs=None,
     ) -> Optional[Union[List[SamplerOutput], IntermediateTensors]]:
+        use_delayed_sampling = VLLM_DELAYED_SAMPLING and not warmup_mode
+        assert not (use_delayed_sampling and num_steps != 1), \
+            'Delayed sampling is not compatible with MSS!'
+        assert not (use_delayed_sampling and
+            self.parallel_config.pipeline_parallel_size != 1), \
+            'Delayed sampling is not compatible with Pipeline Parallelism!'
+        assert model_input.input_tokens is not None
+        if use_delayed_sampling and not model_input.is_prompt and \
+                self.is_driver_worker:
+            num_cached = len(self.cached_step_outputs)
+            assert num_cached > 0
+            cur_seq_ids = self._get_seq_ids(model_input)
+            cur_seq_id_pos = {
+                sid: idx
+                for idx, sid in enumerate(cur_seq_ids) if sid >= 0
+            }
+            htorch.core.mark_step()
+            for i in range(num_cached):
+                prev_seq_ids = self._get_seq_ids(self.cached_step_inputs[i])
+                target_indices = [
+                    cur_seq_id_pos.get(psi, -1) for psi in prev_seq_ids
+                ]
+                padding = self.cached_step_outputs[i].size(0) - len(
+                    target_indices)
+                target_indices.extend([-1] * padding)
+                target_indices = torch.tensor(
+                    target_indices,
+                    device=model_input.input_tokens.device,
+                    dtype=model_input.input_tokens.dtype)
+                model_input.input_tokens.index_copy_(
+                    0, target_indices, self.cached_step_outputs[i])
+                htorch.core.mark_step()
+
         if not model_input.is_first_multi_step:
             if not model_input.is_last_step:
                 # not first or last multi-step
@@ -1940,7 +2642,21 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                 assert model_input.lora_mapping is not None
                 self.set_active_loras(model_input.lora_requests,
                                       model_input.lora_mapping)
-            input_tokens = model_input.input_tokens
+            # Rank!=0 workers has is_prompt==None
+            if use_delayed_sampling and not model_input.is_prompt and \
+                    model_input.input_tokens.size(1) == 1:
+                if self.is_driver_worker:
+                    model_kwargs_broadcast_data = {
+                        "input_tokens": model_input.input_tokens
+                    }
+                    broadcast_tensor_dict(model_kwargs_broadcast_data, src=0)
+                    input_tokens = model_input.input_tokens
+
+                else:
+                    model_kwargs_broadcast_data = broadcast_tensor_dict(src=0)
+                    input_tokens = model_kwargs_broadcast_data["input_tokens"]
+            else:
+                input_tokens = model_input.input_tokens
             input_positions = model_input.input_positions
             attn_metadata = model_input.attn_metadata
             sampling_metadata = model_input.sampling_metadata
@@ -1955,7 +2671,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
             batch_size = input_tokens.size(0)
             seq_len = self._seq_len(attn_metadata)
             use_graphs = self._use_graphs(batch_size, seq_len, is_prompt)
-            self._check_config(batch_size, seq_len, is_prompt, warmup_mode)
+            self._check_config(batch_size, seq_len, attn_metadata, warmup_mode)
 
             lora_mask: torch.Tensor = None
             lora_logits_mask: torch.Tensor = None
@@ -1964,7 +2680,6 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                 lora_mask, lora_logits_mask = self.create_lora_mask(
                     input_tokens, model_input.lora_ids,
                     attn_metadata.is_prompt)
-
             execute_model_kwargs = {
                 "input_ids": input_tokens,
                 "positions": input_positions,
@@ -1972,6 +2687,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                 "attn_metadata": self.trim_attn_metadata(attn_metadata),
                 "intermediate_tensors": intermediate_tensors,
                 "lora_mask": lora_mask,
+                "virtual_engine": model_input.virtual_engine,
                 **(model_input.multi_modal_kwargs or {}),
             }
             if previous_hidden_states is not None:
@@ -1990,7 +2706,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                                     f"graphs{'T' if use_graphs else 'F'}")
             else:
                 model_event_name = 'model_executable'
-            if num_steps > 1:
+            if num_steps > 1 or use_delayed_sampling:
                 # in case of multi-step scheduling
                 # we only want to pythonize in the last step
                 sampling_metadata.skip_sampler_cpu_output = True
@@ -2000,8 +2716,8 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
             def try_revert_dummy_output_tokens():
                 if len(cache_orig_output_tokens_len) > 0:
                     # Reuse the original output token ids length
-                    for i, seq_group_metadata in enumerate(
-                            seq_group_metadata_list):
+                    for i in range(len(cache_orig_output_tokens_len)):
+                        seq_group_metadata = seq_group_metadata_list[i]
                         for j, data in seq_group_metadata.seq_data.items():
                             orig_output_tokens_len = \
                                 cache_orig_output_tokens_len[i][j]
@@ -2023,7 +2739,14 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                         self.trim_attn_metadata(
                             broadcast_data["attn_metadata"])
                     })
-                with self.profiler.record_event('internal', model_event_name):
+                profiler_args = {
+                    'real_seq_len': model_input.seq_lens,
+                    'real_batch_size': real_batch_size
+                }
+
+                with self.profiler.record_event('internal',
+                                                model_event_name,
+                                                args=profiler_args):
                     hidden_states = self.model.forward(
                         **execute_model_kwargs,
                         selected_token_indices=sampling_metadata.
@@ -2033,6 +2756,8 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                     LoraMask.setLoraMask(
                         lora_logits_mask.index_select(
                             0, sampling_metadata.selected_token_indices))
+                if not get_pp_group().is_last_rank:
+                    return hidden_states
 
                 # Compute the logits.
                 with self.profiler.record_event(
@@ -2040,7 +2765,8 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                     ('compute_logits_'
                      f'{"prompt" if is_prompt else "decode"}_bs'
                      f'{batch_size}_'
-                     f'seq{seq_len}')):
+                     f'seq{seq_len}'),
+                        args=profiler_args):
                     if num_steps == 1:
                         sampling_metadata.selected_token_indices = None
                     logits = self.model.compute_logits(hidden_states,
@@ -2050,23 +2776,34 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                 if not self.is_driver_worker:
                     continue
 
-                if model_input.async_callback is not None:
+                if use_delayed_sampling:
+                    fake_output = self._delayed_sampler_outputs(model_input)
+                elif model_input.async_callback is not None:
                     model_input.async_callback()
-                # Sample the next token.
+
                 with self.profiler.record_event(
                         'internal', ('sample_'
                                      f'{"prompt" if is_prompt else "decode"}_'
                                      f'bs{batch_size}_'
-                                     f'seq{seq_len}')):
+                                     f'seq{seq_len}'),
+                        args=profiler_args):
                     output = self.model.sample(
                         logits=logits,
                         sampling_metadata=sampling_metadata,
                     )
                     if num_steps > 1:
                         output = output.sampled_token_ids
-                        self.cached_step_outputs.append(
-                            output.detach().clone())
+                        self.cached_step_outputs.append(output)
+                    if use_delayed_sampling and self.is_driver_worker:
+                        self._patch_prev_output()
+                        output = self._pad_to_max_num_seqs(
+                            output.sampled_token_ids, DUMMY_TOKEN_ID)
+                        self.cached_step_outputs.append(output)
+                        self.cached_step_inputs.append(model_input)
                 htorch.core.mark_step()
+                if use_delayed_sampling \
+                   and model_input.async_callback is not None:
+                    model_input.async_callback()
                 if i < num_steps - 1:
                     if i == 0:
                         if model_input.async_callback is not None:
@@ -2079,7 +2816,7 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                         else:
                             raise RuntimeError(
                                 "seq_group_metadata_list is uninitialized")
-                        for i, seq_group_metadata in enumerate(
+                        for seq_idx, seq_group_metadata in enumerate(
                                 seq_group_metadata_list):
                             # Skip empty steps
                             seq_group_metadata.state.current_step += (
@@ -2087,8 +2824,10 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                             # Cache the original output token ids
                             cache_orig_output_tokens_len.append({})
                             for j, data in seq_group_metadata.seq_data.items():
-                                cache_orig_output_tokens_len[i][j] = \
+                                cache_orig_output_tokens_len[seq_idx][j] = \
                                     len(data.output_token_ids)
+                    seq_group_metadata_list, _, _ = self._add_dummy_seq(
+                        seq_group_metadata_list, is_prompt=False)
                     for seq_group_metadata in seq_group_metadata_list:
                         for data in seq_group_metadata.seq_data.values():
                             max_output_len = sampling_metadata.seq_groups[
@@ -2109,18 +2848,31 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
 
                     result = self._prepare_decode(seq_group_metadata_list,
                                                   output=output)
+                    if self.lora_config:
+                        lora_mapping = LoRAMapping(
+                            **dict(index_mapping=result.lora_index_mapping,
+                                   prompt_mapping=result.lora_prompt_mapping,
+                                   is_prefill=False))
+                        self.set_active_loras(result.lora_requests,
+                                              lora_mapping)
+                        lora_mask, lora_logits_mask = self.create_lora_mask(
+                            result.input_tokens, result.lora_ids, False)
+
                     execute_model_kwargs.update({
                         "input_ids":
                         result.input_tokens,
                         "positions":
                         result.input_positions,
                         "attn_metadata":
-                        self.trim_attn_metadata(result.attn_metadata)
+                        self.trim_attn_metadata(result.attn_metadata),
+                        "lora_mask":
+                        lora_mask,
                     })
                     model_kwargs_broadcast_data = {
                         "input_ids": result.input_tokens,
                         "positions": result.input_positions,
-                        "attn_metadata": vars(result.attn_metadata)
+                        "attn_metadata": vars(result.attn_metadata),
+                        "lora_mask": lora_mask,
                     }
                     broadcast_tensor_dict(model_kwargs_broadcast_data, src=0)
                 else:
@@ -2145,11 +2897,24 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                     if model_input.is_prompt:
                         output.prefill_hidden_states = hidden_states
                     output.hidden_states = hidden_states
+                if use_delayed_sampling:
+                    if self.is_driver_worker:
+                        return [fake_output]
+                    else:
+                        return []
+
                 return [output] if self.is_driver_worker else []
             else:
                 return []
 
         return output if type(output) is list else [output]
+
+    def _delayed_sampler_outputs(self, model_input):
+        next_token_ids = [[DUMMY_TOKEN_ID]] * len(
+            model_input.sampling_metadata.seq_groups)
+        sampler_output = self._make_decode_output(
+            next_token_ids, model_input.sampling_metadata.seq_groups)
+        return sampler_output
 
     def _decode_sampler_outputs(self, model_input):
         use_async_out_proc = model_input.async_callback is not None
@@ -2201,13 +2966,31 @@ class HPUModelRunner(HPUModelRunnerBase[ModelInputForHPUWithSamplingMetadata]):
                 CompletionSequenceGroupOutput(seq_outputs, None))
         return SamplerOutput(sampler_outputs)
 
-    def shutdown_inc(self):
-        can_finalize_inc = (self.model_config.quantization == 'inc') and \
-            (self.model.model is not None) and \
-            self.inc_initialized_successfully and \
-            not getattr(self, "_is_inc_finalized", False)
-        if can_finalize_inc:
-            from neural_compressor.torch.quantization import (
-                finalize_calibration)
-            finalize_calibration(self.model.model)
-            self._is_inc_finalized = True
+    def _patch_prev_output(self):
+        assert len(self.cached_step_inputs) == len(self.cached_step_outputs), \
+            f'''Inputs and outputs are out of sync!
+            {len(self.cached_step_inputs)} vs {len(self.cached_step_outputs)}'''
+        if len(self.cached_step_inputs) == 0:
+            return
+        model_input = self.cached_step_inputs.pop(0)
+        delayed_output = self.cached_step_outputs.pop(0).cpu().squeeze(
+            -1).tolist()
+        ctx = model_input.async_callback.keywords["ctx"]  # type: ignore
+        # If there's no output to patch with, which is usually the case when
+        # we're starting a new request after all requests are completed.
+        if len(ctx.output_queue) == 0:
+            return
+        assert len(
+            ctx.output_queue) == 1, 'There should be exactly 1 output waiting!'
+        output_data = ctx.output_queue[0]
+        assert len(output_data.outputs) == 1
+        for fake_out, real_out in zip(output_data.outputs[0], delayed_output):
+            fake_out.samples[0].output_token = real_out
+        for sg, real_out in zip(output_data.seq_group_metadata_list,
+                                delayed_output):
+            assert len(sg.seq_data) == 1
+            seq_data = list(sg.seq_data.values())[0]
+            # This is a hack. Assigning output_token_ids triggers
+            # a cache recomputation and we only need to update the last token
+            seq_data.output_token_ids_array[-1] = real_out
+            seq_data._cached_all_token_ids[-1] = real_out

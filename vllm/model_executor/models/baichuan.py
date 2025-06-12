@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
 #
 # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
@@ -116,6 +118,7 @@ class BaiChuanAttention(nn.Module):
         max_position_embeddings: int = 8192,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -158,7 +161,8 @@ class BaiChuanAttention(nn.Module):
                                   self.head_dim,
                                   scaling,
                                   alibi_slopes=alibi_slopes,
-                                  quant_config=quant_config)
+                                  quant_config=quant_config,
+                                  prefix=f"{prefix}.attn")
         else:
             self.rotary_emb = get_rope(
                 self.head_dim,
@@ -171,7 +175,8 @@ class BaiChuanAttention(nn.Module):
                                   self.head_dim,
                                   self.scaling,
                                   cache_config=cache_config,
-                                  quant_config=quant_config)
+                                  quant_config=quant_config,
+                                  prefix=f"{prefix}.attn")
 
     def forward(
         self,
@@ -195,7 +200,8 @@ class BaiChuanDecoderLayer(nn.Module):
                  config: PretrainedConfig,
                  position_embedding: str,
                  cache_config: Optional[CacheConfig] = None,
-                 quant_config: Optional[QuantizationConfig] = None):
+                 quant_config: Optional[QuantizationConfig] = None,
+                 prefix: str = ""):
         super().__init__()
         self.hidden_size = config.hidden_size
         rope_theta = getattr(config, "rope_theta", 10000)
@@ -209,6 +215,7 @@ class BaiChuanDecoderLayer(nn.Module):
             max_position_embeddings=max_position_embeddings,
             cache_config=cache_config,
             quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
         )
         self.mlp = BaiChuanMLP(
             hidden_size=self.hidden_size,
@@ -275,8 +282,11 @@ class BaiChuanModel(nn.Module):
         )
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: BaiChuanDecoderLayer(config, position_embedding,
-                                                cache_config, quant_config),
+            lambda prefix: BaiChuanDecoderLayer(config,
+                                                position_embedding,
+                                                cache_config,
+                                                quant_config,
+                                                prefix=prefix),
             prefix=f"{prefix}.layers",
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

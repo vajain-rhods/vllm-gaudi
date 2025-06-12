@@ -1,8 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+
 import warnings
 from typing import Optional
 
 import pytest
-from PIL import Image
 
 from vllm.assets.image import ImageAsset
 from vllm.config import ModelConfig
@@ -20,7 +21,7 @@ from ..utils import VLLM_PATH
 EXAMPLES_DIR = VLLM_PATH / "examples"
 
 PHI3V_MODEL_ID = "microsoft/Phi-3.5-vision-instruct"
-ULTRAVOX_MODEL_ID = "fixie-ai/ultravox-v0_3"
+ULTRAVOX_MODEL_ID = "fixie-ai/ultravox-v0_5-llama-3_2-1b"
 QWEN2VL_MODEL_ID = "Qwen/Qwen2-VL-2B-Instruct"
 MLLAMA_MODEL_ID = "meta-llama/Llama-3.2-11B-Vision-Instruct"
 LLAMA_GUARD_MODEL_ID = "meta-llama/Llama-Guard-3-1B"
@@ -91,10 +92,7 @@ def _assert_mm_data_is_image_input(
     image_data = mm_data.get("image")
     assert image_data is not None
 
-    if image_count == 1:
-        assert isinstance(image_data, Image.Image)
-    else:
-        assert isinstance(image_data, list) and len(image_data) == image_count
+    assert isinstance(image_data, list) and len(image_data) == image_count
 
 
 def test_parse_chat_messages_single_image(
@@ -758,6 +756,7 @@ def test_resolve_content_format_hf_defined(model, expected_format):
      ("template_chatglm.jinja", "string"),
      ("template_chatglm2.jinja", "string"),
      ("template_chatml.jinja", "string"),
+     ("template_deepseek_vl2.jinja", "string"),
      ("template_falcon_180b.jinja", "string"),
      ("template_falcon.jinja", "string"),
      ("template_inkbot.jinja", "string"),
@@ -766,8 +765,8 @@ def test_resolve_content_format_hf_defined(model, expected_format):
      ("tool_chat_template_granite_20b_fc.jinja", "string"),
      ("tool_chat_template_hermes.jinja", "string"),
      ("tool_chat_template_internlm2_tool.jinja", "string"),
-     ("tool_chat_template_llama3.1_json.jinja", "string"),
-     ("tool_chat_template_llama3.2_json.jinja", "string"),
+     ("tool_chat_template_llama3.1_json.jinja", "openai"),
+     ("tool_chat_template_llama3.2_json.jinja", "openai"),
      ("tool_chat_template_mistral_parallel.jinja", "string"),
      ("tool_chat_template_mistral.jinja", "string")],
 )
