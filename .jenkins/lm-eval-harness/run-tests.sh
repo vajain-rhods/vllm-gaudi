@@ -13,7 +13,7 @@ usage() {
 }
 
 SUCCESS=0
-
+TIMEOUT_S=900 # 15 minutes timeout per test
 while getopts "c:t:" OPT; do
   case ${OPT} in
     c ) 
@@ -42,16 +42,22 @@ do
     export LM_EVAL_TP_SIZE=$TP_SIZE
     export PT_HPU_ENABLE_LAZY_COLLECTIVES=true
     export VLLM_SKIP_WARMUP=true
+    export TQDM_BAR_FORMAT="{desc}: {percentage:3.0f}% {bar:10} | {n_fmt}/{total_fmt} [{elapsed}<{remaining}]" 
     RANDOM_SUFFIX=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 4; echo)
-    JUNIT_SUFFIX=""
+    JUNIT_FAMILY=""
+    JUNIT_XML=""
     if [[ -n "$TEST_RESULTS_DIR" ]]; then
         LOG_DIR=$TEST_RESULTS_DIR
         LOG_FILENAME="test_${MODEL_CONFIG}_${RANDOM_SUFFIX}.xml"
         LOG_PATH="${LOG_DIR}/${LOG_FILENAME}"
-        JUNIT_SUFFIX="-o junit_family=xunit1 --junitxml=${LOG_PATH}"
+        JUNIT_FAMILY="-o junit_family=xunit1"
+        JUNIT_XML="--junitxml=${LOG_PATH}"
     fi
-    pytest -s test_lm_eval_correctness.py "$JUNIT_SUFFIX" || LOCAL_SUCCESS=$?
-
+    timeout $TIMEOUT_S pytest -s test_lm_eval_correctness.py "$JUNIT_FAMILY" "$JUNIT_XML" &
+    TEST_PROCESS=$!
+    wait $TEST_PROCESS
+    LOCAL_SUCCESS=$?
+    kill -9 $TEST_PROCESS 2> /dev/null || true
     if [[ $LOCAL_SUCCESS == 0 ]]; then
         echo "=== PASSED MODEL: ${MODEL_CONFIG} ==="
     else

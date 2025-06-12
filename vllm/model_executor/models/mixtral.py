@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
 # Copyright 2023 The vLLM team.
@@ -44,7 +46,6 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader, maybe_remap_kv_scale_name)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 
 from .interfaces import SupportsLoRA, SupportsPP
@@ -167,7 +168,8 @@ class MixtralAttention(nn.Module):
                               self.scaling,
                               num_kv_heads=self.num_kv_heads,
                               cache_config=cache_config,
-                              quant_config=quant_config)
+                              quant_config=quant_config,
+                              prefix=f"{prefix}.attn")
 
     def forward(
         self,
@@ -347,6 +349,7 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
         lora_config = vllm_config.lora_config
         self.config = config
         self.lora_config = lora_config
+        self.quant_config = quant_config
 
         self.model = MixtralModel(vllm_config=vllm_config,
                                   prefix=maybe_prefix(prefix, "model"))
@@ -428,6 +431,18 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
             if "rotary_emb.inv_freq" in name:
                 continue
 
+            if (self.quant_config is not None and
+                (scale_name := self.quant_config.get_cache_scale(name))):
+                # Loading kv cache quantization scales
+                param = params_dict[scale_name]
+                weight_loader = getattr(param, "weight_loader",
+                                        default_weight_loader)
+                loaded_weight = (loaded_weight if loaded_weight.dim() == 0 else
+                                 loaded_weight[0])
+                weight_loader(param, loaded_weight)
+                loaded_params.add(scale_name)
+                continue
+
             for (param_name, weight_name, shard_id) in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -439,7 +454,11 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                 # Skip layers on other devices.
                 if is_pp_missing_parameter(name, self):
                     continue
-
+                if name.endswith("scale"):
+                    # Remapping the name of FP8 kv-scale.
+                    name = maybe_remap_kv_scale_name(name, params_dict)
+                    if name is None:
+                        continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -482,6 +501,4 @@ class MixtralForCausalLM(nn.Module, SupportsLoRA, SupportsPP):
                                             default_weight_loader)
                     weight_loader(param, loaded_weight)
             loaded_params.add(name)
-            if current_platform.is_hpu():
-                torch.hpu.synchronize()
         return loaded_params

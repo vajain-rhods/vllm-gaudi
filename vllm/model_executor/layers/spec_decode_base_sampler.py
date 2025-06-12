@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 from abc import abstractmethod
 from typing import Dict, Optional, Union
 
@@ -32,8 +34,10 @@ class SpecDecodeBaseSampler(nn.Module):
 
     def init_tensors(self,
                      device: Union[int, str],
-                     device_type: str = 'cuda') -> None:
+                     device_type: Union[torch.device, str] = 'cuda') -> None:
         assert self.num_accepted_tokens is None
+        if isinstance(device_type, torch.device):
+            device_type = device_type.type
         if isinstance(device, int):
             device = f"{device_type}:{device}"
         self.num_accepted_tokens = torch.tensor(0,
