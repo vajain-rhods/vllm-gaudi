@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+
 # Adapted from
 # https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
 # Copyright 2023 The vLLM team.
@@ -170,6 +172,7 @@ class MixtralAttention(nn.Module):
         rope_theta: float = 10000,
         quant_config: Optional[QuantizationConfig] = None,
         cache_config: Optional[CacheConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -219,7 +222,8 @@ class MixtralAttention(nn.Module):
                               self.scaling,
                               num_kv_heads=self.num_kv_heads,
                               cache_config=cache_config,
-                              quant_config=quant_config)
+                              quant_config=quant_config,
+                              prefix=f"{prefix}.attn")
 
     def forward(
         self,
@@ -243,6 +247,7 @@ class MixtralDecoderLayer(nn.Module):
         config: MixtralConfig,
         cache_config: Optional[CacheConfig] = None,
         quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
     ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -255,7 +260,9 @@ class MixtralDecoderLayer(nn.Module):
             num_kv_heads=config.num_key_value_heads,
             rope_theta=rope_theta,
             cache_config=cache_config,
-            quant_config=quant_config)
+            quant_config=quant_config,
+            prefix=f"{prefix}.self_attn",
+        )
         self.block_sparse_moe = MixtralMoE(config=config,
                                            quant_config=quant_config)
         self.input_layernorm = RMSNorm(config.hidden_size,
@@ -311,7 +318,8 @@ class MixtralModel(nn.Module):
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
             lambda prefix: MixtralDecoderLayer(
-                config, cache_config, quant_config=quant_config),
+                config, cache_config, quant_config=quant_config, prefix=prefix
+            ),
             prefix=f"{prefix}.layers")
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = (

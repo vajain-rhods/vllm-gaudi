@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 from typing import List, Optional, Tuple
 
 from vllm import EngineArgs, LLMEngine, RequestOutput, SamplingParams
@@ -19,7 +20,7 @@ def create_test_prompts(
                         prompt_logprobs=1,
                         max_tokens=128), None),
         ("To be or not to be,",
-         SamplingParams(temperature=0.8,
+         SamplingParams(temperature=0.0,
                         top_k=5,
                         presence_penalty=0.2,
                         max_tokens=128), None),
@@ -81,7 +82,7 @@ def process_requests(engine: LLMEngine,
 
 expected_output = [
     " or, through inaction, allow a human being to come to harm.\nA robot must obey the orders given it by human beings except where such orders would conflict with the First Law.\nA robot must protect its own existence as long as such protection does not conflict with the First or Second Law.\nThe Three Laws of Robotics were created by Isaac Asimov in 1942. They are the foundation of robotics and artificial intelligence.\nThe Three Laws of Robotics are the foundation of robotics and artificial intelligence. They were created by Isaac Asimov in 194",  # noqa: E501
-    " that is the question.\nIt is the most famous line in all of Shakespeare's plays and one of the most famous in English literature. The question is not whether or not to be, but rather the question of who to be.\nIn Hamlet's case, the question is whether or not to be a good person. He is torn between the goodness of his father and the evil of his mother.\nThe question is a difficult one, and one that has been asked many times before. In Hamlet's case, the question is whether or not to be a good person, and he is torn between the",  # noqa: E501
+    " that is the question.\nThe question is not whether you will be, but how you will be.\nThe question is not whether you will be, but how you will be.\nThe question is not whether you will be, but how you will be.\nThe question is not whether you will be, but how you will be.\nThe question is not whether you will be, but how you will be.\nThe question is not whether you will be, but how you will be.\nThe question is not whether you will be, but how you will be.\nThe question is not whether you will be, but",  # noqa: E501
     "  SELECT icao FROM table_name_74 WHERE airport = 'lilongwe international airport' ",  # noqa: E501
     "  SELECT nationality FROM table_name_11 WHERE elector = 'anchero pantaleone' ",  # noqa: E501
     "  SELECT icao FROM table_name_74 WHERE airport = 'lilongwe international airport' ",  # noqa: E501
@@ -91,13 +92,14 @@ expected_output = [
 
 def _test_llama_multilora(sql_lora_files, tp_size):
     """Main function that sets up and runs the prompt processing."""
-    engine_args = EngineArgs(model="meta-llama/Llama-2-7b-hf",
-                             enable_lora=True,
-                             max_loras=2,
-                             max_lora_rank=8,
-                             max_num_seqs=256,
-                             dtype='float32',
-                             tensor_parallel_size=tp_size)
+    engine_args = EngineArgs(
+        model="/mnt/weka/data/pytorch/llama2/Llama-2-7b-hf",
+        enable_lora=True,
+        max_loras=2,
+        max_lora_rank=8,
+        max_num_seqs=256,
+        dtype='float32',
+        tensor_parallel_size=tp_size)
     engine = LLMEngine.from_engine_args(engine_args)
     test_prompts = create_test_prompts(sql_lora_files)
     results = process_requests(engine, test_prompts)
