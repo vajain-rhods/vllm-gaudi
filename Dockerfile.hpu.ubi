@@ -164,8 +164,8 @@ RUN set -e; \
 RUN ln -s /usr/bin/python3 /usr/bin/python && \
     python3 -m pip install habana_media_loader=="${VERSION}"."${REVISION}"
 
-# FIXME: This is not a reliable way to start up sshd. Find out if this is
-# truly needed. If so, we need to start it off the ENTRYPOINT with vllm
+# FIXME: This is not a reliable way to start up sshd. It would be better to
+# convert the ENTRYPOINT into a script that starts both sshd and vllm
 # SSH configuration necessary to support mpi-operator v2
 RUN mkdir -p /var/run/sshd && \
     sed -i 's/[ #]\(.*StrictHostKeyChecking \).*/ \1no/g' /etc/ssh/ssh_config && \
@@ -208,8 +208,7 @@ RUN dnf install --nobest --nodocs --setopt=install_weak_deps=false --allowerasin
     dnf clean all
 
 COPY --from=clone_repo /src/sai/dockerfiles/pytorch/install_packages.sh ./install_packages.sh
-RUN ./install_packages.sh && rm -f install_packages.sh && \
-    /sbin/ldconfig && echo "source /etc/profile.d/habanalabs.sh" >> ~/.bashrc
+RUN ./install_packages.sh && rm -f install_packages.sh && /sbin/ldconfig
 
 # Set LD_PRELOAD after all required installations to
 # avoid warnings during docker creation
@@ -298,7 +297,9 @@ RUN umask 002 && \
     useradd --uid 2000 --gid 0 vllm && \
     mkdir -p /home/vllm && \
     chown -R vllm /home/vllm && \
-    chmod g+rwx /home/vllm
+    chmod g+rwx /home/vllm && \
+    cp /root/.bashrc /home/vllm && \
+    chown vllm /home/vllm/.bashrc
 
 COPY LICENSE /licenses/vllm.md
 COPY examples/*.jinja /app/data/template/
