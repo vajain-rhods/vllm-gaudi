@@ -164,15 +164,14 @@ RUN set -e; \
 RUN ln -s /usr/bin/python3 /usr/bin/python && \
     python3 -m pip install habana_media_loader=="${VERSION}"."${REVISION}"
 
-# FIXME: This is not a reliable way to start up sshd. It would be better to
-# convert the ENTRYPOINT into a script that starts both sshd and vllm
 # SSH configuration necessary to support mpi-operator v2
+# Convert ENTRYPOINTs into scripts so that sshd can be started
 RUN mkdir -p /var/run/sshd && \
     sed -i 's/[ #]\(.*StrictHostKeyChecking \).*/ \1no/g' /etc/ssh/ssh_config && \
     sed -i 's/#\(ForwardAgent \).*/\1yes/g' /etc/ssh/ssh_config && \
     echo "    UserKnownHostsFile /dev/null" >> /etc/ssh/ssh_config && \
-    sed -i 's/#\(StrictModes \).*/\1no/g' /etc/ssh/sshd_config && \
-    echo "/usr/sbin/sshd -p 3022" | tee -a ~/.bashrc
+    sed -i 's/#\(StrictModes \).*/\1no/g' /etc/ssh/sshd_config
+COPY --chmod=0755 *-entrypoint.sh /usr/bin/
 
 ENV GC_KERNEL_PATH=/usr/lib/habanalabs/libtpc_kernels.so
 ENV HABANA_LOGS=/var/log/habana_logs/
@@ -297,25 +296,22 @@ RUN umask 002 && \
     useradd --uid 2000 --gid 0 vllm && \
     mkdir -p /home/vllm && \
     chown -R vllm /home/vllm && \
-    chmod g+rwx /home/vllm && \
-    cp /root/.bashrc /home/vllm && \
-    chown vllm /home/vllm/.bashrc
+    chmod g+rwx /home/vllm
 
 COPY LICENSE /licenses/vllm.md
 COPY examples/*.jinja /app/data/template/
 
-USER 2000
+#USER 2000
+# Note: staying root because entrypoint starts sshd and then changes to vllm
 WORKDIR /home/vllm
 
-# FIXME: Need to change this into a script so that sshd can be reliably started
-ENTRYPOINT ["python3", "-m", "vllm.entrypoints.openai.api_server"]
+ENTRYPOINT ["/usr/bin/vllm-entrypoint.sh"]
 
 ######## vllm-grpc-adapter ####################################################
 FROM vllm-openai as vllm-grpc-adapter
 
 USER root
 
-# FIXME: Does gaudi need a TGIS adapter?
 ARG VLLM_TGIS_ADAPTER_VERSION="0.7.1"
 RUN --mount=type=cache,target=/root/.cache/pip \
     --mount=type=bind,from=build,src=/workspace/dist,target=/workspace/dist \
@@ -337,6 +333,6 @@ ENV GRPC_PORT=8033 \
     # see: https://github.com/vllm-project/vllm/pull/6485
     DISABLE_LOGPROBS_DURING_SPEC_DECODING=false
 
-# FIXME: Need to change this into a script so that sshd can be reliably started
-USER 2000
-ENTRYPOINT ["python3", "-m", "vllm_tgis_adapter", "--uvicorn-log-level=warning"]
+#USER 2000
+# Note: staying root because entrypoint starts sshd and then changes to vllm
+ENTRYPOINT ["/usr/bin/tgis-entrypoint.sh"]
